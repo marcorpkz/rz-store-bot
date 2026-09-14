@@ -18,7 +18,8 @@ const {
     ButtonBuilder,
     ButtonStyle,
     ChannelType,
-    PermissionFlagsBits
+    PermissionFlagsBits,
+    MessageFlags
 } = require("discord.js");
 
 const client = new Client({
@@ -326,7 +327,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
         await interaction.reply({
             content: "<:okk:1549125132906270851> Painel de compra criado!",
-            ephemeral: true
+            flags: MessageFlags.Ephemeral
         });
 
         await interaction.channel.send({
@@ -405,7 +406,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
         await interaction.reply({
             content: "<:okk:1549125132906270851> Painel de Korblox e Headless criado!",
-            ephemeral: true
+            flags: MessageFlags.Ephemeral
         });
 
         await interaction.channel.send({
@@ -519,7 +520,7 @@ client.on(Events.InteractionCreate, async interaction => {
         await interaction.reply({
             embeds: [embedConfirmacao],
             components: [botoes],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral
         });
 
         return;
@@ -559,7 +560,7 @@ client.on(Events.InteractionCreate, async interaction => {
         if (!produto) {
             await interaction.reply({
                 content: "<:x_:1549124126575165533> Produto inválido.",
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
             return;
         }
@@ -607,7 +608,7 @@ client.on(Events.InteractionCreate, async interaction => {
         await interaction.reply({
             embeds: [embedConfirmacaoItem],
             components: [botoesItem],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral
         });
 
         return;
@@ -636,7 +637,7 @@ client.on(Events.InteractionCreate, async interaction => {
             await interaction.reply({
                 content:
                     "<:x_:1549124126575165533> Digite uma quantidade válida de pelo menos **100 Robux**.",
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
 
             return;
@@ -695,7 +696,7 @@ client.on(Events.InteractionCreate, async interaction => {
         await interaction.reply({
             embeds: [embedConfirmacao],
             components: [botoes],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral
         });
 
         return;
@@ -1151,7 +1152,7 @@ if (ticketExistente) {
                 await interaction.reply({
                     content:
                         "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode fechar este ticket.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
 
                 return;
@@ -1185,7 +1186,7 @@ if (ticketExistente) {
                     "<:danger:1549129849904566392> **Tem certeza que deseja fechar este ticket?**\n\n" +
                     "O canal será apagado.",
                 components: [confirmarFechamento],
-                ephemeral: true
+                flags: MessageFlags.Ephemeral
             });
 
             return;
@@ -1209,7 +1210,7 @@ if (ticketExistente) {
                 await interaction.reply({
                     content:
                         "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode fechar este ticket.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
 
                 return;
@@ -1279,7 +1280,7 @@ if (ticketExistente) {
                 await interaction.reply({
                     content:
                         "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode fechar este ticket.",
-                    ephemeral: true
+                    flags: MessageFlags.Ephemeral
                 });
 
                 return;
@@ -1295,6 +1296,18 @@ if (ticketExistente) {
 
     }
 
+});
+
+client.on("error", error => {
+    console.error("ERRO DO DISCORD:", error);
+});
+
+process.on("unhandledRejection", error => {
+    console.error("PROMISE NÃO TRATADA:", error);
+});
+
+process.on("uncaughtException", error => {
+    console.error("ERRO NÃO TRATADO:", error);
 });
 
 client.login(process.env.DISCORD_TOKEN);
