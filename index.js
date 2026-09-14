@@ -16,6 +16,8 @@ const {
     TextInputStyle,
     ButtonBuilder,
     ButtonStyle,
+    ChannelType,
+    PermissionFlagsBits
 } = require("discord.js");
 
 const client = new Client({
@@ -112,9 +114,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("Quantidade personalizada")
-                    .setDescription(
-                        "Escolha exatamente quantos Robux deseja"
-                    )
+                    .setDescription("Escolha exatamente quantos Robux deseja")
                     .setValue("personalizado")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -327,6 +327,7 @@ client.on(Events.InteractionCreate, async interaction => {
         return;
     }
 
+
     // =========================================
     // MENU DE ROBUX
     // =========================================
@@ -338,7 +339,10 @@ client.on(Events.InteractionCreate, async interaction => {
 
         const opcao = interaction.values[0];
 
+        // =========================================
         // QUANTIDADE PERSONALIZADA
+        // =========================================
+
         if (opcao === "personalizado") {
 
             const modal = new ModalBuilder()
@@ -364,7 +368,11 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
+
+        // =========================================
         // QUANTIDADES PRONTAS
+        // =========================================
+
         const quantidade = Number(opcao);
 
         const valor = (quantidade / 100) * 3.20;
@@ -390,13 +398,35 @@ client.on(Events.InteractionCreate, async interaction => {
                 text: "RZ Store"
             });
 
+
+        // BOTÕES
+        const botoes = new ActionRowBuilder()
+            .addComponents(
+
+                new ButtonBuilder()
+                    .setCustomId(`confirmar_compra_${quantidade}`)
+                    .setLabel("Confirmar compra")
+                    .setEmoji("✅")
+                    .setStyle(ButtonStyle.Success),
+
+                new ButtonBuilder()
+                    .setCustomId("cancelar_compra")
+                    .setLabel("Cancelar")
+                    .setEmoji("✖️")
+                    .setStyle(ButtonStyle.Danger)
+
+            );
+
+
         await interaction.reply({
             embeds: [embedConfirmacao],
+            components: [botoes],
             ephemeral: true
         });
 
         return;
     }
+
 
     // =========================================
     // MODAL DE QUANTIDADE PERSONALIZADA
@@ -426,6 +456,7 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
+
         const valor = (quantidade / 100) * 3.20;
 
         const valorFormatado = valor.toLocaleString("pt-BR", {
@@ -449,12 +480,258 @@ client.on(Events.InteractionCreate, async interaction => {
                 text: "RZ Store"
             });
 
+
+        // BOTÕES
+        const botoes = new ActionRowBuilder()
+            .addComponents(
+
+                new ButtonBuilder()
+                    .setCustomId(`confirmar_compra_${quantidade}`)
+                    .setLabel("Confirmar compra")
+                    .setEmoji("✅")
+                    .setStyle(ButtonStyle.Success),
+
+                new ButtonBuilder()
+                    .setCustomId("cancelar_compra")
+                    .setLabel("Cancelar")
+                    .setEmoji("✖️")
+                    .setStyle(ButtonStyle.Danger)
+
+            );
+
+
         await interaction.reply({
             embeds: [embedConfirmacao],
+            components: [botoes],
             ephemeral: true
         });
 
         return;
+    }
+
+
+    // =========================================
+    // BOTÕES
+    // =========================================
+
+    if (interaction.isButton()) {
+
+        // =========================================
+        // CONFIRMAR COMPRA
+        // =========================================
+
+        if (
+    interaction.customId.startsWith(
+        "confirmar_compra_"
+    )
+) {
+
+    const quantidade = Number(
+        interaction.customId.replace(
+            "confirmar_compra_",
+            ""
+        )
+    );
+
+    const valor = (quantidade / 100) * 3.20;
+
+    const quantidadeFormatada =
+        quantidade.toLocaleString("pt-BR");
+
+    const valorFormatado =
+        valor.toLocaleString("pt-BR", {
+            style: "currency",
+            currency: "BRL"
+        });
+
+    const guild = interaction.guild;
+
+    const nomeUsuario = interaction.user.username
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "")
+        .slice(0, 15);
+
+    try {
+
+        const ticket = await guild.channels.create({
+
+            name: `compra-${nomeUsuario}`,
+
+            type: ChannelType.GuildText,
+
+            parent: process.env.CATEGORY_TICKETS_ID,
+
+            topic: `Compra de ${interaction.user.tag} | ID: ${interaction.user.id}`,
+
+            permissionOverwrites: [
+
+                // @everyone não vê
+                {
+                    id: guild.roles.everyone.id,
+                    deny: [
+                        PermissionFlagsBits.ViewChannel
+                    ]
+                },
+
+                // CLIENTE
+                {
+                    id: interaction.user.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
+                    ]
+                },
+
+                // EQUIPE
+                {
+                    id: process.env.STAFF_ROLE_ID,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.ManageMessages
+                    ]
+                }
+
+            ]
+
+        });
+
+        const embedTicket = new EmbedBuilder()
+            .setColor("#00db0f")
+            .setTitle(
+                "<:greencart:1548089836647485591> Novo pedido — RZ Store"
+            )
+            .setDescription(
+                `Olá ${interaction.user}! Seu ticket de compra foi criado com sucesso.\n\n` +
+
+                `### <:greenrbx:1548088739677470881> Detalhes do pedido\n` +
+                `> **Cliente:** ${interaction.user}\n` +
+                `> **Quantidade:** ${quantidadeFormatada} Robux\n` +
+                `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n\n` +
+
+                `### ⏳ Status\n` +
+                `> Aguardando pagamento.\n\n` +
+
+                `Em breve o pagamento via PIX será gerado neste canal.`
+            )
+            .setFooter({
+                text: "RZ Store"
+            })
+            .setTimestamp();
+
+        await ticket.send({
+            content: `${interaction.user} <@&${process.env.STAFF_ROLE_ID}>`,
+            embeds: [embedTicket]
+        });
+
+        const embedCriado = new EmbedBuilder()
+            .setColor("#00db0f")
+            .setTitle("✅ Ticket criado!")
+            .setDescription(
+                `Seu pedido foi confirmado.\n\n` +
+                `<:greenrbx:1548088739677470881> **${quantidadeFormatada} Robux**\n` +
+                `<:pix:1548090281402966107> **${valorFormatado}**\n\n` +
+                `Acesse seu ticket: ${ticket}`
+            )
+            .setFooter({
+                text: "RZ Store"
+            });
+
+        await interaction.update({
+            embeds: [embedCriado],
+            components: []
+        });
+
+    } catch (error) {
+
+        console.error("Erro ao criar ticket:", error);
+
+        await interaction.update({
+            content:
+                "❌ Ocorreu um erro ao criar seu ticket. Entre em contato com a equipe.",
+            embeds: [],
+            components: []
+        });
+
+    }
+
+    return;
+}
+
+            const quantidade = Number(
+                interaction.customId.replace(
+                    "confirmar_compra_",
+                    ""
+                )
+            );
+
+            const valor = (quantidade / 100) * 3.20;
+
+            const quantidadeFormatada =
+                quantidade.toLocaleString("pt-BR");
+
+            const valorFormatado =
+                valor.toLocaleString("pt-BR", {
+                    style: "currency",
+                    currency: "BRL"
+                });
+
+            const embedConfirmado = new EmbedBuilder()
+                .setColor("#00db0f")
+                .setTitle(
+                    "✅ Compra confirmada"
+                )
+                .setDescription(
+                    `<:greenrbx:1548088739677470881> **Quantidade:** ${quantidadeFormatada} Robux\n` +
+                    `<:pix:1548090281402966107> **Valor:** ${valorFormatado}\n\n` +
+                    "Seu pedido foi confirmado e será preparado."
+                )
+                .setFooter({
+                    text: "RZ Store"
+                });
+
+            await interaction.update({
+                embeds: [embedConfirmado],
+                components: []
+            });
+
+            return;
+        }
+
+
+        // =========================================
+        // CANCELAR COMPRA
+        // =========================================
+
+        if (
+            interaction.customId === "cancelar_compra"
+        ) {
+
+            const embedCancelado = new EmbedBuilder()
+                .setColor("#ff0000")
+                .setTitle(
+                    "❌ Compra cancelada"
+                )
+                .setDescription(
+                    "A compra foi cancelada.\n\n" +
+                    "Você pode selecionar outra quantidade no painel quando quiser."
+                )
+                .setFooter({
+                    text: "RZ Store"
+                });
+
+            await interaction.update({
+                embeds: [embedCancelado],
+                components: []
+            });
+
+            return;
+        }
+
     }
 
 });
