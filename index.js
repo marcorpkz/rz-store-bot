@@ -97,6 +97,11 @@ client.on(Events.InteractionCreate, async interaction => {
                 "> <a:animatedarrowgreen:1548150127414480966> Os Robux serão enviados manualmente pela equipe da RZ Store.\n" +
                 "> <a:animatedarrowgreen:1548150127414480966> Em alguns casos, a transferência pode ficar pendente pelo sistema do Roblox.\n\n" +
 
+                "<:exclamacoes:1548095775873961985> **— POLÍTICA DE ESTORNO**\n" +
+                "> <a:animatedarrowgreen:1548150127414480966> Após a entrega dos Robux, **não será possível realizar estorno**, pois os Robux enviados não podem ser devolvidos à RZ Store.\n" +
+                "> <a:animatedarrowgreen:1548150127414480966> Ao realizar a compra, você declara estar ciente desta condição, ressalvados eventuais direitos previstos em lei.\n" +
+                "> <a:animatedarrowgreen:1548150127414480966> O estorno será realizado apenas se não tivermos estoque para o envio do Robux\n\n" +
+
                 "<:interrogacoes:1548096277856649296> **— PRECISOU DE AJUDA?**\n" +
                 "> <:sup:1548200025442750505> Nossa equipe estará disponível no seu ticket para ajudar."
             )
@@ -546,6 +551,37 @@ client.on(Events.InteractionCreate, async interaction => {
 
     const guild = interaction.guild;
 
+    const ticketExistente = guild.channels.cache.find(channel =>
+    channel.type === ChannelType.GuildText &&
+    channel.parentId === process.env.CATEGORY_TICKETS_ID &&
+    (
+        channel.topic?.includes(`rzstore-user:${interaction.user.id}`) ||
+        channel.topic?.includes(`ID: ${interaction.user.id}`)
+    )
+);
+
+if (ticketExistente) {
+
+    const embedTicketExistente = new EmbedBuilder()
+        .setColor("#00db0f")
+        .setTitle("⚠️ Você já possui um ticket aberto")
+        .setDescription(
+            `Você já tem uma compra em andamento.\n\n` +
+            `Acesse seu ticket: ${ticketExistente}\n\n` +
+            `Finalize ou feche esse ticket antes de iniciar outra compra.`
+        )
+        .setFooter({
+            text: "RZ Store"
+        });
+
+    await interaction.update({
+        embeds: [embedTicketExistente],
+        components: []
+    });
+
+    return;
+}
+
     const nomeUsuario = interaction.user.username
         .toLowerCase()
         .replace(/[^a-z0-9]/g, "")
@@ -561,7 +597,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
             parent: process.env.CATEGORY_TICKETS_ID,
 
-            topic: `Compra de ${interaction.user.tag} | ID: ${interaction.user.id}`,
+            topic: `RZ Store | rzstore-user:${interaction.user.id} | Compra de ${interaction.user.tag}`,
 
             permissionOverwrites: [
 
@@ -623,9 +659,19 @@ client.on(Events.InteractionCreate, async interaction => {
             })
             .setTimestamp();
 
+        const botaoFecharTicket = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId("fechar_ticket")
+                    .setLabel("Fechar ticket")
+                    .setEmoji("🔒")
+                    .setStyle(ButtonStyle.Danger)
+            );
+
         await ticket.send({
             content: `${interaction.user} <@&${process.env.STAFF_ROLE_ID}>`,
-            embeds: [embedTicket]
+            embeds: [embedTicket],
+            components: [botaoFecharTicket]
         });
 
         const embedCriado = new EmbedBuilder()
@@ -662,45 +708,6 @@ client.on(Events.InteractionCreate, async interaction => {
     return;
 }
 
-            const quantidade = Number(
-                interaction.customId.replace(
-                    "confirmar_compra_",
-                    ""
-                )
-            );
-
-            const valor = (quantidade / 100) * 3.20;
-
-            const quantidadeFormatada =
-                quantidade.toLocaleString("pt-BR");
-
-            const valorFormatado =
-                valor.toLocaleString("pt-BR", {
-                    style: "currency",
-                    currency: "BRL"
-                });
-
-            const embedConfirmado = new EmbedBuilder()
-                .setColor("#00db0f")
-                .setTitle(
-                    "✅ Compra confirmada"
-                )
-                .setDescription(
-                    `<:greenrbx:1548088739677470881> **Quantidade:** ${quantidadeFormatada} Robux\n` +
-                    `<:pix:1548090281402966107> **Valor:** ${valorFormatado}\n\n` +
-                    "Seu pedido foi confirmado e será preparado."
-                )
-                .setFooter({
-                    text: "RZ Store"
-                });
-
-            await interaction.update({
-                embeds: [embedConfirmado],
-                components: []
-            });
-
-            return;
-        }
 
 
         // =========================================
@@ -726,6 +733,160 @@ client.on(Events.InteractionCreate, async interaction => {
 
             await interaction.update({
                 embeds: [embedCancelado],
+                components: []
+            });
+
+            return;
+        }
+
+
+        // =========================================
+        // FECHAR TICKET
+        // =========================================
+
+        if (
+            interaction.customId === "fechar_ticket"
+        ) {
+
+            if (
+                !interaction.member.roles.cache.has(
+                    process.env.STAFF_ROLE_ID
+                )
+            ) {
+
+                await interaction.reply({
+                    content:
+                        "❌ Apenas a equipe da RZ Store pode fechar este ticket.",
+                    ephemeral: true
+                });
+
+                return;
+            }
+
+            const confirmarFechamento = new ActionRowBuilder()
+                .addComponents(
+
+                    new ButtonBuilder()
+                        .setCustomId("confirmar_fechar_ticket")
+                        .setLabel("Sim, fechar")
+                        .setEmoji("✅")
+                        .setStyle(ButtonStyle.Danger),
+
+                    new ButtonBuilder()
+                        .setCustomId("cancelar_fechar_ticket")
+                        .setLabel("Cancelar")
+                        .setEmoji("✖️")
+                        .setStyle(ButtonStyle.Secondary)
+
+                );
+
+            await interaction.reply({
+                content:
+                    "⚠️ **Tem certeza que deseja fechar este ticket?**\n\n" +
+                    "O canal será apagado.",
+                components: [confirmarFechamento],
+                ephemeral: true
+            });
+
+            return;
+        }
+
+
+        // =========================================
+        // CONFIRMAR FECHAMENTO DO TICKET
+        // =========================================
+
+        if (
+            interaction.customId === "confirmar_fechar_ticket"
+        ) {
+
+            if (
+                !interaction.member.roles.cache.has(
+                    process.env.STAFF_ROLE_ID
+                )
+            ) {
+
+                await interaction.reply({
+                    content:
+                        "❌ Apenas a equipe da RZ Store pode fechar este ticket.",
+                    ephemeral: true
+                });
+
+                return;
+            }
+
+            const ehTicketRZ =
+                interaction.channel.parentId ===
+                    process.env.CATEGORY_TICKETS_ID &&
+                interaction.channel.topic?.includes(
+                    "RZ Store | rzstore-user:"
+                );
+
+            if (!ehTicketRZ) {
+
+                await interaction.update({
+                    content:
+                        "❌ Este canal não foi reconhecido como um ticket de compra da RZ Store.",
+                    components: []
+                });
+
+                return;
+            }
+
+            await interaction.update({
+                content:
+                    "🔒 Ticket fechado. Este canal será apagado em **3 segundos**.",
+                components: []
+            });
+
+            setTimeout(async () => {
+
+                try {
+
+                    await interaction.channel.delete(
+                        `Ticket fechado por ${interaction.user.tag}`
+                    );
+
+                } catch (error) {
+
+                    console.error(
+                        "Erro ao apagar ticket:",
+                        error
+                    );
+
+                }
+
+            }, 3000);
+
+            return;
+        }
+
+
+        // =========================================
+        // CANCELAR FECHAMENTO DO TICKET
+        // =========================================
+
+        if (
+            interaction.customId === "cancelar_fechar_ticket"
+        ) {
+
+            if (
+                !interaction.member.roles.cache.has(
+                    process.env.STAFF_ROLE_ID
+                )
+            ) {
+
+                await interaction.reply({
+                    content:
+                        "❌ Apenas a equipe da RZ Store pode fechar este ticket.",
+                    ephemeral: true
+                });
+
+                return;
+            }
+
+            await interaction.update({
+                content: "✅ Fechamento cancelado.",
                 components: []
             });
 
