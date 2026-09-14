@@ -8,6 +8,7 @@ const {
     REST,
     Routes,
     EmbedBuilder,
+    AttachmentBuilder,
     ActionRowBuilder,
     StringSelectMenuBuilder,
     StringSelectMenuOptionBuilder,
@@ -33,7 +34,11 @@ client.once("clientReady", async () => {
     const commands = [
         new SlashCommandBuilder()
             .setName("setupcomprar")
-            .setDescription("Cria o painel de compra de Robux")
+            .setDescription("Cria o painel de compra de Robux"),
+
+        new SlashCommandBuilder()
+            .setName("korblox")
+            .setDescription("Cria o painel de Korblox e Headless")
     ].map(command => command.toJSON());
 
     const rest = new REST({ version: "10" })
@@ -51,7 +56,7 @@ client.once("clientReady", async () => {
             }
         );
 
-        console.log("Comando /setupcomprar registrado no servidor.");
+        console.log("Comandos /setupcomprar e /korblox registrados no servidor.");
 
     } catch (error) {
 
@@ -320,13 +325,92 @@ client.on(Events.InteractionCreate, async interaction => {
             .addComponents(menu);
 
         await interaction.reply({
-            content: "✅ Painel de compra criado!",
+            content: "<:okk:1549125132906270851> Painel de compra criado!",
             ephemeral: true
         });
 
         await interaction.channel.send({
             embeds: [embed],
             components: [row]
+        });
+
+        return;
+    }
+
+
+    // =========================================
+    // COMANDO /korblox
+    // =========================================
+
+    if (
+        interaction.isChatInputCommand() &&
+        interaction.commandName === "korblox"
+    ) {
+
+        
+
+        const embedKorblox = new EmbedBuilder()
+            .setColor("#00db0f")
+            .setTitle("<:coroa:1548189671501078588> Korblox & Headless — RZ Store")
+            .setDescription(
+                "## ‹ KORBLOX & HEADLESS ⇄ RZ STORE ›\n\n" +
+
+                "<:greencart:1548089836647485591> **— ESCOLHA SEU ITEM**\n" +
+                "> <a:animatedarrowgreen:1548150127414480966> **Korblox:** 17.000 Robux — **R$ 544,00**\n" +
+                "> <a:animatedarrowgreen:1548150127414480966> **Headless:** 31.000 Robux — **R$ 992,00**\n\n" +
+
+                "<:pix:1548090281402966107> **— COMO FUNCIONA A COMPRA**\n" +
+                "> <a:animatedarrowgreen:1548150127414480966> Selecione abaixo a quantidade de Robux que deseja comprar.\n" +
+                "> <a:animatedarrowgreen:1548150127414480966> Confirme o pedido para criar seu ticket privado.\n" +
+                "> <a:animatedarrowgreen:1548150127414480966> O pagamento e a entrega serão acompanhados pela equipe no ticket.\n\n" +
+
+                "<:exclamacoes:1548095775873961985> **— POLÍTICA DE ESTORNO**\n" +
+                "> <a:animatedarrowgreen:1548150127414480966> Após a entrega do Robux, **não será possível realizar estorno**.\n" +
+                "> <a:animatedarrowgreen:1548150127414480966> O estorno será realizado apenas se não tivermos estoque para realizar a entrega.\n\n" +
+
+                "<:interrogacoes:1548096277856649296> **— PRECISOU DE AJUDA?**\n" +
+                "> <:sup:1548200025442750505> Nossa equipe estará disponível no seu ticket para ajudar."
+            )
+            .setImage("https://cdn.discordapp.com/attachments/1548159183071879228/1548159369059762218/korblox_headless.png?ex=6aa95704&is=6aa80584&hm=2396d2211826f3393801d7e6644acc954fa14b8c0aa5e1cc964b9803a82b2313&")
+            .setFooter({
+                text: "RZ Store"
+            });
+
+        const menuKorblox = new StringSelectMenuBuilder()
+            .setCustomId("comprar_korblox_headless")
+            .setPlaceholder("Clique aqui para escolher o item")
+            .addOptions(
+
+                new StringSelectMenuOptionBuilder()
+                    .setLabel("Korblox")
+                    .setDescription("17.000 Robux • R$ 544,00")
+                    .setValue("korblox")
+                    .setEmoji({
+                        id: "1549132176048525363",
+                        name: "korblox"
+                    }),
+
+                new StringSelectMenuOptionBuilder()
+                    .setLabel("Headless")
+                    .setDescription("31.000 Robux • R$ 992,00")
+                    .setValue("headless")
+                    .setEmoji({
+                        id: "1549132702249259109",
+                        name: "headless"
+                    })
+            );
+
+        const rowKorblox = new ActionRowBuilder()
+            .addComponents(menuKorblox);
+
+        await interaction.reply({
+            content: "<:okk:1549125132906270851> Painel de Korblox e Headless criado!",
+            ephemeral: true
+        });
+
+        await interaction.channel.send({
+        embeds: [embedKorblox],
+        components: [rowKorblox]
         });
 
         return;
@@ -414,13 +498,19 @@ client.on(Events.InteractionCreate, async interaction => {
                 new ButtonBuilder()
                     .setCustomId(`confirmar_compra_${quantidade}`)
                     .setLabel("Confirmar compra")
-                    .setEmoji("✅")
+                    .setEmoji({
+                        id: "1549125132906270851",
+                        name: "okk"
+                    })
                     .setStyle(ButtonStyle.Success),
 
                 new ButtonBuilder()
                     .setCustomId("cancelar_compra")
                     .setLabel("Cancelar")
-                    .setEmoji("✖️")
+                    .setEmoji({
+                        id: "1549124126575165533",
+                        name: "x_"
+                    })
                     .setStyle(ButtonStyle.Danger)
 
             );
@@ -429,6 +519,94 @@ client.on(Events.InteractionCreate, async interaction => {
         await interaction.reply({
             embeds: [embedConfirmacao],
             components: [botoes],
+            ephemeral: true
+        });
+
+        return;
+    }
+
+
+    // =========================================
+    // MENU KORBLOX / HEADLESS
+    // =========================================
+
+    if (
+        interaction.isStringSelectMenu() &&
+        interaction.customId === "comprar_korblox_headless"
+    ) {
+
+        const opcao = interaction.values[0];
+
+        await interaction.message.edit({
+            components: interaction.message.components.map(row => row.toJSON())
+        });
+
+        const produtos = {
+            korblox: {
+                nome: "Korblox",
+                robux: 17000,
+                valor: 544
+            },
+            headless: {
+                nome: "Headless",
+                robux: 31000,
+                valor: 992
+            }
+        };
+
+        const produto = produtos[opcao];
+
+        if (!produto) {
+            await interaction.reply({
+                content: "<:x_:1549124126575165533> Produto inválido.",
+                ephemeral: true
+            });
+            return;
+        }
+
+        const robuxFormatado = produto.robux.toLocaleString("pt-BR");
+        const valorFormatado = produto.valor.toLocaleString("pt-BR", {
+            style: "currency",
+            currency: "BRL"
+        });
+
+        const embedConfirmacaoItem = new EmbedBuilder()
+            .setColor("#00db0f")
+            .setTitle(`<:greencart:1548089836647485591> Compra de ${produto.nome}`)
+            .setDescription(
+                `Você selecionou **${produto.nome}**.\n\n` +
+                `<:greenrbx:1548088739677470881> **Preço em Robux:** ${robuxFormatado}\n` +
+                `<:pix:1548090281402966107> **Valor:** ${valorFormatado}`
+            )
+            .setFooter({
+                text: "RZ Store"
+            });
+
+        const botoesItem = new ActionRowBuilder()
+            .addComponents(
+
+                new ButtonBuilder()
+                    .setCustomId(`confirmar_item_${opcao}`)
+                    .setLabel("Confirmar compra")
+                    .setEmoji({
+                        id: "1549125132906270851",
+                        name: "okk"
+                    })
+                    .setStyle(ButtonStyle.Success),
+
+                new ButtonBuilder()
+                    .setCustomId("cancelar_compra")
+                    .setLabel("Cancelar")
+                    .setEmoji({
+                        id: "1549124126575165533",
+                        name: "x_"
+                    })
+                    .setStyle(ButtonStyle.Danger)
+            );
+
+        await interaction.reply({
+            embeds: [embedConfirmacaoItem],
+            components: [botoesItem],
             ephemeral: true
         });
 
@@ -457,7 +635,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
             await interaction.reply({
                 content:
-                    "❌ Digite uma quantidade válida de pelo menos **100 Robux**.",
+                    "<:x_:1549124126575165533> Digite uma quantidade válida de pelo menos **100 Robux**.",
                 ephemeral: true
             });
 
@@ -496,13 +674,19 @@ client.on(Events.InteractionCreate, async interaction => {
                 new ButtonBuilder()
                     .setCustomId(`confirmar_compra_${quantidade}`)
                     .setLabel("Confirmar compra")
-                    .setEmoji("✅")
+                    .setEmoji({
+                        id: "1549125132906270851",
+                        name: "okk"
+                    })
                     .setStyle(ButtonStyle.Success),
 
                 new ButtonBuilder()
                     .setCustomId("cancelar_compra")
                     .setLabel("Cancelar")
-                    .setEmoji("✖️")
+                    .setEmoji({
+                        id: "1549124126575165533",
+                        name: "x_"
+                    })
                     .setStyle(ButtonStyle.Danger)
 
             );
@@ -567,7 +751,7 @@ if (ticketExistente) {
 
     const embedTicketExistente = new EmbedBuilder()
         .setColor("#00db0f")
-        .setTitle("⚠️ Você já possui um ticket aberto")
+        .setTitle("<:danger:1549129849904566392> Você já possui um ticket aberto")
         .setDescription(
             `Você já tem uma compra em andamento.\n\n` +
             `Acesse seu ticket: ${ticketExistente}\n\n` +
@@ -652,7 +836,7 @@ if (ticketExistente) {
                 `> **Quantidade:** ${quantidadeFormatada} Robux\n` +
                 `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n\n` +
 
-                `### ⏳ Status\n` +
+                `### <:ampulheta:1549129208557469786> Status\n` +
                 `> Aguardando pagamento.\n\n` +
 
                 `Em breve o pagamento via PIX será gerado neste canal.`
@@ -667,7 +851,10 @@ if (ticketExistente) {
                 new ButtonBuilder()
                     .setCustomId("fechar_ticket")
                     .setLabel("Fechar ticket")
-                    .setEmoji("🔒")
+                    .setEmoji({
+                        id: "1549128145381367949",
+                        name: "cadeado~1"
+                    })
                     .setStyle(ButtonStyle.Danger)
             );
 
@@ -679,7 +866,7 @@ if (ticketExistente) {
 
         const embedCriado = new EmbedBuilder()
             .setColor("#00db0f")
-            .setTitle("✅ Ticket criado!")
+            .setTitle("<:okk:1549125132906270851> Ticket criado!")
             .setDescription(
                 `Seu pedido foi confirmado.\n\n` +
                 `<:greenrbx:1548088739677470881> **${quantidadeFormatada} Robux**\n` +
@@ -701,7 +888,7 @@ if (ticketExistente) {
 
         await interaction.update({
             content:
-                "❌ Ocorreu um erro ao criar seu ticket. Entre em contato com a equipe.",
+                "<:x_:1549124126575165533> Ocorreu um erro ao criar seu ticket. Entre em contato com a equipe.",
             embeds: [],
             components: []
         });
@@ -711,6 +898,210 @@ if (ticketExistente) {
     return;
 }
 
+
+
+        // =========================================
+        // CONFIRMAR KORBLOX / HEADLESS
+        // =========================================
+
+        if (
+            interaction.customId.startsWith(
+                "confirmar_item_"
+            )
+        ) {
+
+            const opcao = interaction.customId.replace(
+                "confirmar_item_",
+                ""
+            );
+
+            const produtos = {
+                korblox: {
+                    nome: "Korblox",
+                    robux: 17000,
+                    valor: 544
+                },
+                headless: {
+                    nome: "Headless",
+                    robux: 31000,
+                    valor: 992
+                }
+            };
+
+            const produto = produtos[opcao];
+
+            if (!produto) {
+                await interaction.update({
+                    content: "<:x_:1549124126575165533> Produto inválido.",
+                    embeds: [],
+                    components: []
+                });
+                return;
+            }
+
+            const guild = interaction.guild;
+
+            const ticketExistente = guild.channels.cache.find(channel =>
+                channel.type === ChannelType.GuildText &&
+                channel.parentId === process.env.CATEGORY_TICKETS_ID &&
+                (
+                    channel.topic?.includes(`rzstore-user:${interaction.user.id}`) ||
+                    channel.topic?.includes(`ID: ${interaction.user.id}`)
+                )
+            );
+
+            if (ticketExistente) {
+
+                const embedTicketExistente = new EmbedBuilder()
+                    .setColor("#00db0f")
+                    .setTitle("<:danger:1549129849904566392> Você já possui um ticket aberto")
+                    .setDescription(
+                        `Você já tem uma compra em andamento.\n\n` +
+                        `Acesse seu ticket: ${ticketExistente}\n\n` +
+                        `Finalize ou feche esse ticket antes de iniciar outra compra.`
+                    )
+                    .setFooter({
+                        text: "RZ Store"
+                    });
+
+                await interaction.update({
+                    embeds: [embedTicketExistente],
+                    components: []
+                });
+
+                return;
+            }
+
+            const nomeUsuario = interaction.user.username
+                .toLowerCase()
+                .replace(/[^a-z0-9]/g, "")
+                .slice(0, 15);
+
+            const robuxFormatado = produto.robux.toLocaleString("pt-BR");
+            const valorFormatado = produto.valor.toLocaleString("pt-BR", {
+                style: "currency",
+                currency: "BRL"
+            });
+
+            try {
+
+                const ticket = await guild.channels.create({
+
+                    name: `${opcao}-${nomeUsuario}`,
+
+                    type: ChannelType.GuildText,
+
+                    parent: process.env.CATEGORY_TICKETS_ID,
+
+                    topic: `RZ Store | rzstore-user:${interaction.user.id} | Produto: ${produto.nome} | Compra de ${interaction.user.tag}`,
+
+                    permissionOverwrites: [
+
+                        {
+                            id: guild.roles.everyone.id,
+                            deny: [
+                                PermissionFlagsBits.ViewChannel
+                            ]
+                        },
+
+                        {
+                            id: interaction.user.id,
+                            allow: [
+                                PermissionFlagsBits.ViewChannel,
+                                PermissionFlagsBits.SendMessages,
+                                PermissionFlagsBits.ReadMessageHistory,
+                                PermissionFlagsBits.AttachFiles,
+                                PermissionFlagsBits.EmbedLinks
+                            ]
+                        },
+
+                        {
+                            id: process.env.STAFF_ROLE_ID,
+                            allow: [
+                                PermissionFlagsBits.ViewChannel,
+                                PermissionFlagsBits.SendMessages,
+                                PermissionFlagsBits.ReadMessageHistory,
+                                PermissionFlagsBits.ManageMessages
+                            ]
+                        }
+
+                    ]
+
+                });
+
+                const embedTicketItem = new EmbedBuilder()
+                    .setColor("#00db0f")
+                    .setTitle("<:greencart:1548089836647485591> Novo pedido — RZ Store")
+                    .setDescription(
+                        `Olá ${interaction.user}! Seu ticket de compra foi criado com sucesso.\n\n` +
+
+                        `### <:esmeralda:1548188465508909118> Detalhes do pedido\n` +
+                        `> **Cliente:** ${interaction.user}\n` +
+                        `> **Produto:** ${produto.nome}\n` +
+                        `> <:greenrbx:1548088739677470881> **Preço em Robux:** ${robuxFormatado}\n` +
+                        `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n\n` +
+
+                        `### <:ampulheta:1549129208557469786> Status\n` +
+                        `> Aguardando pagamento.\n\n` +
+
+                        `Em breve o pagamento via PIX será gerado neste canal.`
+                    )
+                    .setFooter({
+                        text: "RZ Store"
+                    })
+                    .setTimestamp();
+
+                const botaoFecharTicketItem = new ActionRowBuilder()
+                    .addComponents(
+                        new ButtonBuilder()
+                            .setCustomId("fechar_ticket")
+                            .setLabel("Fechar ticket")
+                            .setEmoji({
+                                id: "1549128145381367949",
+                                name: "cadeado~1"
+                            })
+                            .setStyle(ButtonStyle.Danger)
+                    );
+
+                await ticket.send({
+                    content: `${interaction.user} <@&${process.env.STAFF_ROLE_ID}>`,
+                    embeds: [embedTicketItem],
+                    components: [botaoFecharTicketItem]
+                });
+
+                const embedCriadoItem = new EmbedBuilder()
+                    .setColor("#00db0f")
+                    .setTitle("<:okk:1549125132906270851> Ticket criado!")
+                    .setDescription(
+                        `Seu pedido foi confirmado.\n\n` +
+                        `<:esmeralda:1548188465508909118> **${produto.nome}**\n` +
+                        `<:pix:1548090281402966107> **${valorFormatado}**\n\n` +
+                        `Acesse seu ticket: ${ticket}`
+                    )
+                    .setFooter({
+                        text: "RZ Store"
+                    });
+
+                await interaction.update({
+                    embeds: [embedCriadoItem],
+                    components: []
+                });
+
+            } catch (error) {
+
+                console.error("Erro ao criar ticket de item:", error);
+
+                await interaction.update({
+                    content:
+                        "<:x_:1549124126575165533> Ocorreu um erro ao criar seu ticket. Entre em contato com a equipe.",
+                    embeds: [],
+                    components: []
+                });
+
+            }
+
+            return;
+        }
 
 
         // =========================================
@@ -724,7 +1115,7 @@ if (ticketExistente) {
             const embedCancelado = new EmbedBuilder()
                 .setColor("#ff0000")
                 .setTitle(
-                    "❌ Compra cancelada"
+                    "<:x_:1549124126575165533> Compra cancelada"
                 )
                 .setDescription(
                     "A compra foi cancelada.\n\n" +
@@ -759,7 +1150,7 @@ if (ticketExistente) {
 
                 await interaction.reply({
                     content:
-                        "❌ Apenas a equipe da RZ Store pode fechar este ticket.",
+                        "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode fechar este ticket.",
                     ephemeral: true
                 });
 
@@ -772,20 +1163,26 @@ if (ticketExistente) {
                     new ButtonBuilder()
                         .setCustomId("confirmar_fechar_ticket")
                         .setLabel("Sim, fechar")
-                        .setEmoji("✅")
+                        .setEmoji({
+                        id: "1549125132906270851",
+                        name: "okk"
+                    })
                         .setStyle(ButtonStyle.Danger),
 
                     new ButtonBuilder()
                         .setCustomId("cancelar_fechar_ticket")
                         .setLabel("Cancelar")
-                        .setEmoji("✖️")
+                        .setEmoji({
+                        id: "1549124126575165533",
+                        name: "x_"
+                    })
                         .setStyle(ButtonStyle.Secondary)
 
                 );
 
             await interaction.reply({
                 content:
-                    "⚠️ **Tem certeza que deseja fechar este ticket?**\n\n" +
+                    "<:danger:1549129849904566392> **Tem certeza que deseja fechar este ticket?**\n\n" +
                     "O canal será apagado.",
                 components: [confirmarFechamento],
                 ephemeral: true
@@ -811,7 +1208,7 @@ if (ticketExistente) {
 
                 await interaction.reply({
                     content:
-                        "❌ Apenas a equipe da RZ Store pode fechar este ticket.",
+                        "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode fechar este ticket.",
                     ephemeral: true
                 });
 
@@ -829,7 +1226,7 @@ if (ticketExistente) {
 
                 await interaction.update({
                     content:
-                        "❌ Este canal não foi reconhecido como um ticket de compra da RZ Store.",
+                        "<:x_:1549124126575165533> Este canal não foi reconhecido como um ticket de compra da RZ Store.",
                     components: []
                 });
 
@@ -838,7 +1235,7 @@ if (ticketExistente) {
 
             await interaction.update({
                 content:
-                    "🔒 Ticket fechado. Este canal será apagado em **3 segundos**.",
+                    "<:cadeado:1549128145381367949> Ticket fechado. Este canal será apagado em **3 segundos**.",
                 components: []
             });
 
@@ -881,7 +1278,7 @@ if (ticketExistente) {
 
                 await interaction.reply({
                     content:
-                        "❌ Apenas a equipe da RZ Store pode fechar este ticket.",
+                        "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode fechar este ticket.",
                     ephemeral: true
                 });
 
@@ -889,7 +1286,7 @@ if (ticketExistente) {
             }
 
             await interaction.update({
-                content: "✅ Fechamento cancelado.",
+                content: "<:okk:1549125132906270851> Fechamento cancelado.",
                 components: []
             });
 
