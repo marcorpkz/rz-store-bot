@@ -343,6 +343,9 @@ client.on(Events.InteractionCreate, async interaction => {
     ) {
 
         const opcao = interaction.values[0];
+        await interaction.message.edit({
+    components: interaction.message.components.map(row => row.toJSON())
+});
 
         // =========================================
         // QUANTIDADE PERSONALIZADA
