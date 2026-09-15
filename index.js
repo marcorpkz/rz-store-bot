@@ -2226,6 +2226,200 @@ function formatarRobux(
 }
 
 
+function obterModoManutencao() {
+
+    const linha =
+        db.prepare(`
+            SELECT valor
+            FROM configuracoes
+            WHERE chave =
+                'modo_manutencao'
+        `).get();
+
+    return (
+        String(
+            linha?.valor ||
+            "0"
+        ) === "1"
+    );
+}
+
+
+function obterMotivoManutencao() {
+
+    const linha =
+        db.prepare(`
+            SELECT valor
+            FROM configuracoes
+            WHERE chave =
+                'modo_manutencao_motivo'
+        `).get();
+
+    return (
+        linha?.valor?.trim() ||
+        "Estamos realizando uma manutenção rápida na loja."
+    );
+}
+
+
+function definirModoManutencao({
+    ativo,
+    motivo = null,
+    staffDiscordId = null
+}) {
+
+    const valorAtivo =
+        ativo
+            ? "1"
+            : "0";
+
+    const motivoFinal =
+        ativo
+            ? (
+                motivo?.trim() ||
+                "Estamos realizando uma manutenção rápida na loja."
+            )
+            : "";
+
+    db.exec(
+        "BEGIN IMMEDIATE"
+    );
+
+    try {
+
+        const upsert =
+            db.prepare(`
+                INSERT INTO configuracoes (
+                    chave,
+                    valor
+                )
+                VALUES (?, ?)
+
+                ON CONFLICT(chave)
+                DO UPDATE SET
+                    valor =
+                        excluded.valor
+            `);
+
+        upsert.run(
+            "modo_manutencao",
+            valorAtivo
+        );
+
+        upsert.run(
+            "modo_manutencao_motivo",
+            motivoFinal
+        );
+
+        upsert.run(
+            "modo_manutencao_staff_id",
+            staffDiscordId || ""
+        );
+
+        upsert.run(
+            "modo_manutencao_alterado_em",
+            new Date().toISOString()
+        );
+
+        db.exec(
+            "COMMIT"
+        );
+
+    } catch (error) {
+
+        try {
+            db.exec(
+                "ROLLBACK"
+            );
+        } catch {}
+
+        throw error;
+    }
+
+    return {
+        ativo:
+            Boolean(
+                ativo
+            ),
+        motivo:
+            motivoFinal
+    };
+}
+
+
+function montarMensagemManutencao() {
+
+    const motivo =
+        obterMotivoManutencao();
+
+    return (
+        "<:cadeado:1549128145381367949> **A RZ Store está em manutenção no momento.**\n\n" +
+        `> ${motivo}\n\n` +
+        "<:ampulheta:1549129208557469786> As compras estão temporariamente pausadas. Tente novamente quando a manutenção terminar."
+    );
+}
+
+
+function interacaoEhFluxoDeCompra(
+    interaction
+) {
+
+    const customId =
+        interaction.customId ||
+        "";
+
+    if (
+        interaction.isStringSelectMenu()
+    ) {
+
+        return [
+            "comprar_robux",
+            "comprar_korblox_headless"
+        ].includes(
+            customId
+        );
+    }
+
+    if (
+        interaction.isButton()
+    ) {
+
+        return (
+            customId.startsWith(
+                "confirmar_compra_"
+            ) ||
+            customId.startsWith(
+                "confirmar_item_"
+            ) ||
+            customId.startsWith(
+                "usar_cupom_"
+            ) ||
+            customId.startsWith(
+                "gerar_pix_"
+            )
+        );
+    }
+
+    if (
+        interaction.isModalSubmit()
+    ) {
+
+        return (
+            customId ===
+                "modal_quantidade_robux" ||
+            customId.startsWith(
+                "modal_cupom_"
+            ) ||
+            customId.startsWith(
+                "modal_pix_"
+            )
+        );
+    }
+
+    return false;
+}
+
+
 function formatarMoedaCentavos(
     centavos
 ) {
@@ -2483,6 +2677,14 @@ async function atualizarPainelVendas(
                 .addFields(
                     {
                         name:
+                            "\u200b",
+                        value:
+                            "\u200b",
+                        inline:
+                            false
+                    },
+                    {
+                        name:
                             "<:cliente:1548196941102317568> Clientes",
                         value:
                             `> **Clientes únicos:** ${Number(total?.clientes_unicos || 0)}\n` +
@@ -2710,6 +2912,14 @@ async function atualizarPainelEstoque(
         const limiteMaximoPedido =
             obterLimiteMaximoPedido();
 
+        const manutencaoAtiva =
+            obterModoManutencao();
+
+        const motivoManutencao =
+            manutencaoAtiva
+                ? obterMotivoManutencao()
+                : null;
+
         const caminhoBanner =
             path.join(
                 __dirname,
@@ -2724,22 +2934,41 @@ async function atualizarPainelEstoque(
                     "#00db0f"
                 )
                 .setTitle(
-                    "<:greenrbx:1548088739677470881> Estoque disponível — RZ Store"
+                    manutencaoAtiva
+                        ? "<:cadeado:1549128145381367949> Vendas pausadas — RZ Store"
+                        : "<:greenrbx:1548088739677470881> Estoque disponível — RZ Store"
                 )
                 .setDescription(
-                    "Acompanhe abaixo o estoque de Robux da **RZ Store em tempo real**.\n\n" +
+                    (
+                        manutencaoAtiva
+                            ? (
+                                "<:cadeado:1549128145381367949> **A loja está em manutenção.**\n" +
+                                `> ${motivoManutencao}\n\n`
+                            )
+                            : "Acompanhe abaixo o estoque de Robux da **RZ Store em tempo real**.\n\n"
+                    ) +
                     `> <:greenrbx:1548088739677470881> **Estoque total:** ${formatarRobux(estoqueTotal)} Robux\n` +
                     `> <:ampulheta:1549129208557469786> **Pedidos em aberto:** ${formatarRobux(pedidosEmAberto)} Robux\n` +
                     `> <a:greenverification:1548192162653536336> **Disponível agora:** ${formatarRobux(estoqueDisponivel)} Robux\n` +
-                    `> <:greencart:1548089836647485591> **Máximo por pedido:** ${formatarRobux(limiteMaximoPedido)} Robux\n\n` +
-                    "<a:greensparkles:1548099963051843695> Cada pedido pode utilizar no máximo **50% do estoque disponível**. Este painel é atualizado automaticamente conforme novas compras, pagamentos e alterações no estoque."
+                    (
+                        manutencaoAtiva
+                            ? "> <:greencart:1548089836647485591> **Novos pedidos:** Temporariamente pausados\n\n"
+                            : `> <:greencart:1548089836647485591> **Máximo por pedido:** ${formatarRobux(limiteMaximoPedido)} Robux\n\n`
+                    ) +
+                    (
+                        manutencaoAtiva
+                            ? "<:ampulheta:1549129208557469786> As vendas serão liberadas novamente assim que a manutenção terminar."
+                            : "<a:greensparkles:1548099963051843695> Cada pedido pode utilizar no máximo **50% do estoque disponível**. Este painel é atualizado automaticamente conforme novas compras, pagamentos e alterações no estoque."
+                    )
                 )
                 .setImage(
                     "attachment://estoque.png"
                 )
                 .setFooter({
                     text:
-                        "RZ Store • Estoque em tempo real"
+                        manutencaoAtiva
+                            ? "RZ Store • Vendas em manutenção"
+                            : "RZ Store • Estoque em tempo real"
                 })
                 .setTimestamp();
 
@@ -4747,6 +4976,9 @@ client.once("clientReady", async () => {
     console.log(
         `[EXPIRAÇÃO] Prazo configurado: ${obterPrazoExpiracaoPedidoMinutos()} minuto(s).`
     );
+    console.log(
+        `[MANUTENÇÃO] Estado atual: ${obterModoManutencao() ? "ATIVADA" : "DESATIVADA"}.`
+    );
 
     try {
 
@@ -4899,6 +5131,37 @@ client.once("clientReady", async () => {
         new SlashCommandBuilder()
             .setName("vendas")
             .setDescription("Cria ou atualiza o painel fixo de vendas"),
+
+        new SlashCommandBuilder()
+            .setName("manutencao")
+            .setDescription("Ativa ou desativa o modo manutenção da loja")
+            .addStringOption(option =>
+                option
+                    .setName("acao")
+                    .setDescription("Escolha se deseja ativar ou desativar")
+                    .setRequired(true)
+                    .addChoices(
+                        {
+                            name:
+                                "Ativar",
+                            value:
+                                "ativar"
+                        },
+                        {
+                            name:
+                                "Desativar",
+                            value:
+                                "desativar"
+                        }
+                    )
+            )
+            .addStringOption(option =>
+                option
+                    .setName("motivo")
+                    .setDescription("Motivo exibido aos clientes durante a manutenção")
+                    .setRequired(false)
+                    .setMaxLength(200)
+            ),
 
         new SlashCommandBuilder()
             .setName("criarcupom")
@@ -5250,6 +5513,133 @@ client.on(Events.ChannelDelete, async channel => {
 
 
 client.on(Events.InteractionCreate, async interaction => {
+
+    // =========================================
+    // MODO MANUTENÇÃO
+    // =========================================
+
+    if (
+        interaction.isChatInputCommand() &&
+        interaction.commandName ===
+            "manutencao"
+    ) {
+
+        if (
+            !interaction.member.roles.cache.has(
+                process.env.STAFF_ROLE_ID
+            )
+        ) {
+
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode alterar o modo manutenção.",
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        const acao =
+            interaction.options.getString(
+                "acao",
+                true
+            );
+
+        const motivo =
+            interaction.options.getString(
+                "motivo",
+                false
+            );
+
+        const ativar =
+            acao ===
+            "ativar";
+
+        try {
+
+            const resultado =
+                definirModoManutencao({
+                    ativo:
+                        ativar,
+                    motivo,
+                    staffDiscordId:
+                        interaction.user.id
+                });
+
+            await atualizarPainelEstoque(
+                interaction.guild
+            );
+
+            if (resultado.ativo) {
+
+                await interaction.reply({
+                    content:
+                        "<:cadeado:1549128145381367949> **Modo manutenção ativado.**\n\n" +
+                        `> ${resultado.motivo}\n\n` +
+                        "<:ampulheta:1549129208557469786> Novos pedidos, confirmações de compra, cupons e geração de PIX ficam bloqueados até a manutenção ser desativada.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                console.log(
+                    `[MANUTENÇÃO] Ativada por ${interaction.user.tag} (${interaction.user.id}). Motivo: ${resultado.motivo}`
+                );
+
+            } else {
+
+                await interaction.reply({
+                    content:
+                        "<a:greenverification:1548192162653536336> **Modo manutenção desativado.**\n\nAs compras da RZ Store foram liberadas novamente.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                console.log(
+                    `[MANUTENÇÃO] Desativada por ${interaction.user.tag} (${interaction.user.id}).`
+                );
+            }
+
+        } catch (error) {
+
+            console.error(
+                "[MANUTENÇÃO] Erro ao alterar estado:",
+                error
+            );
+
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Não consegui alterar o modo manutenção.",
+                flags:
+                    MessageFlags.Ephemeral
+            });
+        }
+
+        return;
+    }
+
+
+    // =========================================
+    // BLOQUEIO DE COMPRAS DURANTE MANUTENÇÃO
+    // =========================================
+
+    if (
+        obterModoManutencao() &&
+        interacaoEhFluxoDeCompra(
+            interaction
+        )
+    ) {
+
+        await interaction.reply({
+            content:
+                montarMensagemManutencao(),
+            flags:
+                MessageFlags.Ephemeral
+        });
+
+        return;
+    }
+
 
     // =========================================
     // COMANDOS DE CUPOM
