@@ -28,8 +28,10 @@ const {
     Order
 } = require("mercadopago");
 
+const express = require("express");
+
 const QRCode = require("qrcode");
-const { randomUUID } = require("crypto");
+const { randomUUID, createHmac, timingSafeEqual } = require("crypto");
 
 const mercadoPagoClient = new MercadoPagoConfig({
     accessToken: process.env.MERCADO_PAGO_ACCESS_TOKEN,
@@ -42,6 +44,11 @@ const mercadoPagoOrder = new Order(mercadoPagoClient);
 
 const MERCADO_PAGO_TEST_MODE =
     process.env.MERCADO_PAGO_TEST_MODE === "true";
+
+const app = express();
+app.use(express.json());
+
+const PORT = Number(process.env.PORT || 3000);
 
 async function criarCobrancaPix({
     valorCentavos,
@@ -186,6 +193,384 @@ async function criarCobrancaPix({
 }
 
 
+
+
+function validarAssinaturaMercadoPago({
+    xSignature,
+    xRequestId,
+    dataId,
+    secret
+}) {
+
+    if (
+        !xSignature ||
+        !xRequestId ||
+        !dataId ||
+        !secret
+    ) {
+        return false;
+    }
+
+    const partes =
+        String(xSignature)
+            .split(",");
+
+    let ts = null;
+    let v1 = null;
+
+    for (const parte of partes) {
+
+        const [chave, ...resto] =
+            parte.trim().split("=");
+
+        const valor =
+            resto.join("=");
+
+        if (chave === "ts") {
+            ts = valor;
+        }
+
+        if (chave === "v1") {
+            v1 = valor;
+        }
+    }
+
+    if (!ts || !v1) {
+        return false;
+    }
+
+    const idsParaTestar = [
+        String(dataId).toLowerCase(),
+        String(dataId)
+    ];
+
+    for (const id of idsParaTestar) {
+
+        const manifesto =
+            `id:${id};request-id:${xRequestId};ts:${ts};`;
+
+        const assinaturaEsperada =
+            createHmac(
+                "sha256",
+                secret
+            )
+                .update(manifesto)
+                .digest("hex");
+
+        const esperado =
+            Buffer.from(
+                assinaturaEsperada,
+                "utf8"
+            );
+
+        const recebido =
+            Buffer.from(
+                String(v1),
+                "utf8"
+            );
+
+        if (
+            esperado.length === recebido.length &&
+            timingSafeEqual(
+                esperado,
+                recebido
+            )
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+async function processarOrderAprovada(orderId) {
+
+    try {
+
+        const order =
+            await buscarOrderMercadoPago(
+                orderId
+            );
+
+        const pagamento =
+            order.transactions
+                ?.payments?.[0];
+
+        const pagamentoAprovado =
+            (
+                order.status === "processed" &&
+                order.status_detail === "accredited"
+            ) ||
+            (
+                pagamento?.status === "processed" &&
+                pagamento?.status_detail === "accredited"
+            );
+
+        if (!pagamentoAprovado) {
+
+            console.log(
+                `[WEBHOOK] Order ${orderId} ainda não foi aprovada:`,
+                order.status,
+                order.status_detail
+            );
+
+            return;
+        }
+
+        const guild =
+            await client.guilds.fetch(
+                process.env.GUILD_ID
+            );
+
+        const canais =
+            await guild.channels.fetch();
+
+        const ticket =
+            canais.find(channel =>
+                channel &&
+                channel.type ===
+                    ChannelType.GuildText &&
+                channel.topic?.includes(
+                    `mp-order:${orderId}`
+                )
+            );
+
+        if (!ticket) {
+
+            console.log(
+                `[WEBHOOK] Não encontrei ticket para a order ${orderId}.`
+            );
+
+            return;
+        }
+
+        // Impede mensagem duplicada caso o Mercado Pago
+        // reenvie a mesma notificação.
+        if (
+            ticket.topic?.includes(
+                "mp-status:accredited"
+            )
+        ) {
+
+            console.log(
+                `[WEBHOOK] Order ${orderId} já tinha sido confirmada no Discord.`
+            );
+
+            return;
+        }
+
+        const donoTicket =
+            ticket.topic
+                ?.match(
+                    /rzstore-user:(\d+)/
+                )?.[1];
+
+        const paymentId =
+            pagamento?.id || "-";
+
+        const valorPago =
+            Number(
+                order.total_paid_amount ||
+                pagamento?.paid_amount ||
+                pagamento?.amount ||
+                0
+            );
+
+        const valorPagoFormatado =
+            valorPago.toLocaleString(
+                "pt-BR",
+                {
+                    style: "currency",
+                    currency: "BRL"
+                }
+            );
+
+        const embedPagamento =
+            new EmbedBuilder()
+                .setColor("#00db0f")
+                .setTitle(
+                    "<:okk:1549125132906270851> Pagamento confirmado!"
+                )
+                .setDescription(
+                    "<:pix:1548090281402966107> O Mercado Pago confirmou o pagamento deste pedido.\n\n" +
+
+                    `> **Order:** \`${orderId}\`\n` +
+                    `> **Pagamento:** \`${paymentId}\`\n` +
+                    `> **Valor recebido:** ${valorPagoFormatado}\n\n` +
+
+                    "### <:okk:1549125132906270851> Status\n" +
+                    "> **Pagamento aprovado e creditado.**\n\n" +
+
+                    "Aguarde a equipe da RZ Store realizar a entrega."
+                )
+                .setFooter({
+                    text:
+                        "RZ Store • Confirmação automática pelo Mercado Pago"
+                })
+                .setTimestamp();
+
+        await ticket.send({
+            content:
+                donoTicket
+                    ? `<@${donoTicket}>`
+                    : undefined,
+            embeds: [embedPagamento]
+        });
+
+        const topicoAtual =
+            ticket.topic || "";
+
+        const novoTopico =
+            /mp-status:[^|]+/.test(
+                topicoAtual
+            )
+                ? topicoAtual.replace(
+                    /mp-status:[^|]+/,
+                    "mp-status:accredited"
+                )
+                : `${topicoAtual} | mp-status:accredited`;
+
+        await ticket.setTopic(
+            novoTopico
+        );
+
+        console.log(
+            `[WEBHOOK] Pagamento confirmado para a order ${orderId}.`
+        );
+
+        // AQUI depois vamos registrar o gasto no SQLite
+        // e atualizar o cargo do cliente.
+
+    } catch (error) {
+
+        console.error(
+            "[WEBHOOK] Erro ao processar order:",
+            error
+        );
+
+    }
+}
+
+
+app.get("/", (req, res) => {
+    res
+        .status(200)
+        .send("RZ Store Bot online.");
+});
+
+
+app.get("/health", (req, res) => {
+    res.status(200).json({
+        ok: true,
+        bot:
+            client.user?.tag ||
+            "iniciando"
+    });
+});
+
+
+app.post(
+    "/mercadopago/webhook",
+    (req, res) => {
+
+        const dataId =
+            req.query["data.id"] ||
+            req.body?.data?.id;
+
+        const tipo =
+            req.query.type ||
+            req.body?.type;
+
+        const webhookSecret =
+            process.env
+                .MERCADO_PAGO_WEBHOOK_SECRET
+                ?.trim();
+
+        // Durante a PRIMEIRA configuração da URL,
+        // ainda não existe secret. Nesse caso apenas
+        // respondemos 200, mas NÃO processamos pagamento.
+        if (!webhookSecret) {
+
+            console.warn(
+                "[WEBHOOK] Recebido sem MERCADO_PAGO_WEBHOOK_SECRET configurado."
+            );
+
+            return res.sendStatus(200);
+        }
+
+        const assinaturaValida =
+            validarAssinaturaMercadoPago({
+                xSignature:
+                    req.headers[
+                        "x-signature"
+                    ],
+
+                xRequestId:
+                    req.headers[
+                        "x-request-id"
+                    ],
+
+                dataId:
+                    req.query[
+                        "data.id"
+                    ] || dataId,
+
+                secret:
+                    webhookSecret
+            });
+
+        if (!assinaturaValida) {
+
+            console.warn(
+                "[WEBHOOK] Assinatura inválida.",
+                {
+                    temXSignature:
+                        Boolean(
+                            req.headers[
+                                "x-signature"
+                            ]
+                        ),
+
+                    temXRequestId:
+                        Boolean(
+                            req.headers[
+                                "x-request-id"
+                            ]
+                        ),
+
+                    dataId:
+                        dataId || null,
+
+                    tipo:
+                        tipo || null
+                }
+            );
+
+            return res
+                .sendStatus(401);
+        }
+
+        // O Mercado Pago espera 200/201 rapidamente.
+        res.sendStatus(200);
+
+        if (
+            tipo !== "order" ||
+            !dataId
+        ) {
+            return;
+        }
+
+        // Processa depois de já responder ao Mercado Pago.
+        setImmediate(() => {
+            processarOrderAprovada(
+                String(dataId)
+            );
+        });
+    }
+);
+
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds
@@ -228,6 +613,18 @@ client.once("clientReady", async () => {
         console.error(error);
 
     }
+
+    app.listen(PORT, () => {
+
+        console.log(
+            `Webhook HTTP rodando na porta ${PORT}`
+        );
+
+        console.log(
+            `Endpoint local: http://localhost:${PORT}/mercadopago/webhook`
+        );
+
+    });
 
 });
 
@@ -374,17 +771,18 @@ async function enviarPixNoTicket(interaction, dados, valorCentavos) {
 
     const componentesPix = [linhaBotoesPix];
 
-    await interaction.channel.send({
-        embeds: [embedPix],
-        files: [qrAttachment],
-        components: componentesPix
-    });
+    const mensagemPix =
+        await interaction.channel.send({
+            embeds: [embedPix],
+            files: [qrAttachment],
+            components: componentesPix
+        });
 
     const topicoAtual =
         interaction.channel.topic || "";
 
     await interaction.channel.setTopic(
-        `${topicoAtual} | mp-order:${order.id} | mp-payment:${payment?.id || "-"} | mp-status:${payment?.status || order.status || "pending"}`
+        `${topicoAtual} | mp-order:${order.id} | mp-payment:${payment?.id || "-"} | mp-status:${payment?.status || order.status || "pending"} | pix-msg:${mensagemPix.id}`
     );
 
     await interaction.editReply({
@@ -1242,61 +1640,44 @@ client.on(Events.InteractionCreate, async interaction => {
                 return;
             }
 
-            const orderId = interaction.channel.topic
-                ?.match(/mp-order:([A-Za-z0-9]+)/)?.[1];
-
-            if (!orderId) {
-                await interaction.reply({
-                    content:
-                        "<:x_:1549124126575165533> Não encontrei a cobrança PIX deste ticket.",
-                    flags: MessageFlags.Ephemeral
-                });
-
-                return;
-            }
-
-            await interaction.deferReply({
-                flags: MessageFlags.Ephemeral
-            });
-
             try {
 
-                const order =
-                    await buscarOrderMercadoPago(
-                        orderId
+                // O botão está na mesma mensagem do embed do PIX.
+                // Então pegamos o código diretamente do embed,
+                // sem consultar a API do Mercado Pago novamente.
+                const descricao =
+                    interaction.message.embeds?.[0]?.description || "";
+
+                const matchPix =
+                    descricao.match(
+                        /### PIX Copia e Cola\s*```(?:\w+)?\s*([\s\S]*?)```/i
                     );
 
-                const pagamento =
-                    order.transactions
-                        ?.payments?.[0];
-
                 const pixCopiaCola =
-                    pagamento
-                        ?.payment_method
-                        ?.qr_code;
+                    matchPix?.[1]?.trim();
 
                 if (!pixCopiaCola) {
                     throw new Error(
-                        "A order não retornou o código PIX."
+                        "Não encontrei o PIX no embed da mensagem."
                     );
                 }
 
-                // Envia SOMENTE o código para facilitar o "Copiar texto"
-                // no Discord mobile.
-                await interaction.editReply({
-                    content: pixCopiaCola
+                await interaction.reply({
+                    content: pixCopiaCola,
+                    flags: MessageFlags.Ephemeral
                 });
 
             } catch (error) {
 
                 console.error(
-                    "Erro ao recuperar PIX:",
+                    "Erro ao copiar PIX:",
                     error
                 );
 
-                await interaction.editReply({
+                await interaction.reply({
                     content:
-                        "<:x_:1549124126575165533> Não foi possível recuperar o PIX. Tente novamente."
+                        "<:x_:1549124126575165533> Não foi possível recuperar o PIX. Tente novamente.",
+                    flags: MessageFlags.Ephemeral
                 });
 
             }
