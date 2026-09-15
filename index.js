@@ -33,7 +33,11 @@ const express = require("express");
 const QRCode = require("qrcode");
 const { randomUUID, createHmac, timingSafeEqual } = require("crypto");
 const path = require("path");
-const { DatabaseSync } = require("node:sqlite");
+const fs = require("fs");
+const {
+    DatabaseSync,
+    backup
+} = require("node:sqlite");
 
 const mercadoPagoClient = new MercadoPagoConfig({
     accessToken: process.env.MERCADO_PAGO_ACCESS_TOKEN,
@@ -58,6 +62,371 @@ const DATABASE_FILE =
         : "./rz-store.db";
 
 const db = new DatabaseSync(DATABASE_FILE);
+
+// =========================================
+// BACKUP AUTOMÁTICO DO SQLITE
+// =========================================
+
+const BACKUP_DIR =
+    process.env.BACKUP_DIR?.trim()
+        ? path.resolve(
+            __dirname,
+            process.env.BACKUP_DIR.trim()
+        )
+        : path.join(
+            __dirname,
+            "backups"
+        );
+
+const BACKUP_INTERVAL_HOURS =
+    Math.max(
+        1,
+        Number(
+            process.env
+                .BACKUP_INTERVAL_HOURS ||
+            6
+        ) || 6
+    );
+
+const BACKUP_KEEP =
+    Math.max(
+        1,
+        Number(
+            process.env
+                .BACKUP_KEEP ||
+            30
+        ) || 30
+    );
+
+let backupEmAndamento =
+    false;
+
+
+function nomeBaseBancoBackup() {
+
+    return MERCADO_PAGO_TEST_MODE
+        ? "rz-store-test"
+        : "rz-store";
+}
+
+
+function formatarTimestampBackup(
+    data = new Date()
+) {
+
+    return data
+        .toISOString()
+        .replace(
+            /[:.]/g,
+            "-"
+        );
+}
+
+
+function tamanhoArquivoFormatado(
+    bytes
+) {
+
+    const numero =
+        Number(
+            bytes ||
+            0
+        );
+
+    if (
+        numero <
+        1024
+    ) {
+        return `${numero} B`;
+    }
+
+    if (
+        numero <
+        1024 * 1024
+    ) {
+        return `${(
+            numero /
+            1024
+        ).toFixed(1)} KB`;
+    }
+
+    return `${(
+        numero /
+        (
+            1024 *
+            1024
+        )
+    ).toFixed(2)} MB`;
+}
+
+
+function limparBackupsAntigos() {
+
+    fs.mkdirSync(
+        BACKUP_DIR,
+        {
+            recursive:
+                true
+        }
+    );
+
+    const prefixo =
+        `${nomeBaseBancoBackup()}-`;
+
+    const arquivos =
+        fs.readdirSync(
+            BACKUP_DIR,
+            {
+                withFileTypes:
+                    true
+            }
+        )
+            .filter(
+                item =>
+                    item.isFile() &&
+                    item.name.startsWith(
+                        prefixo
+                    ) &&
+                    item.name.endsWith(
+                        ".db"
+                    )
+            )
+            .map(
+                item => {
+
+                    const caminho =
+                        path.join(
+                            BACKUP_DIR,
+                            item.name
+                        );
+
+                    const stat =
+                        fs.statSync(
+                            caminho
+                        );
+
+                    return {
+                        nome:
+                            item.name,
+                        caminho,
+                        mtimeMs:
+                            stat.mtimeMs
+                    };
+                }
+            )
+            .sort(
+                (
+                    a,
+                    b
+                ) =>
+                    b.mtimeMs -
+                    a.mtimeMs
+            );
+
+    const excedentes =
+        arquivos.slice(
+            BACKUP_KEEP
+        );
+
+    for (
+        const arquivo
+        of excedentes
+    ) {
+
+        try {
+
+            fs.unlinkSync(
+                arquivo.caminho
+            );
+
+            console.log(
+                `[BACKUP] Backup antigo removido: ${arquivo.nome}`
+            );
+
+        } catch (error) {
+
+            console.warn(
+                `[BACKUP] Não foi possível remover ${arquivo.nome}:`,
+                error?.message ||
+                error
+            );
+        }
+    }
+
+    return {
+        mantidos:
+            Math.min(
+                arquivos.length,
+                BACKUP_KEEP
+            ),
+        removidos:
+            excedentes.length
+    };
+}
+
+
+async function criarBackupBanco(
+    motivo = "automatico"
+) {
+
+    if (
+        backupEmAndamento
+    ) {
+
+        return {
+            sucesso:
+                false,
+            ocupado:
+                true,
+            mensagem:
+                "Já existe um backup em andamento."
+        };
+    }
+
+    backupEmAndamento =
+        true;
+
+    try {
+
+        fs.mkdirSync(
+            BACKUP_DIR,
+            {
+                recursive:
+                    true
+            }
+        );
+
+        const nomeArquivo =
+            `${nomeBaseBancoBackup()}-${formatarTimestampBackup()}.db`;
+
+        const caminhoBackup =
+            path.join(
+                BACKUP_DIR,
+                nomeArquivo
+            );
+
+        console.log(
+            `[BACKUP] Iniciando backup (${motivo})...`
+        );
+
+        const paginas =
+            await backup(
+                db,
+                caminhoBackup
+            );
+
+        // Abre a cópia em modo somente leitura e pede ao
+        // próprio SQLite para validar a integridade.
+        let bancoBackup = null;
+
+        try {
+
+            bancoBackup =
+                new DatabaseSync(
+                    caminhoBackup,
+                    {
+                        readOnly:
+                            true
+                    }
+                );
+
+            const integridade =
+                bancoBackup
+                    .prepare(
+                        "PRAGMA integrity_check"
+                    )
+                    .get();
+
+            const resultadoIntegridade =
+                String(
+                    Object.values(
+                        integridade ||
+                        {}
+                    )[0] ||
+                    ""
+                ).toLowerCase();
+
+            if (
+                resultadoIntegridade !==
+                "ok"
+            ) {
+
+                throw new Error(
+                    `integrity_check retornou: ${resultadoIntegridade || "sem resposta"}`
+                );
+            }
+
+        } finally {
+
+            try {
+
+                bancoBackup
+                    ?.close();
+
+            } catch {}
+        }
+
+        const stat =
+            fs.statSync(
+                caminhoBackup
+            );
+
+        const rotacao =
+            limparBackupsAntigos();
+
+        const resultado = {
+            sucesso:
+                true,
+            motivo,
+            nomeArquivo,
+            caminho:
+                caminhoBackup,
+            tamanhoBytes:
+                stat.size,
+            tamanho:
+                tamanhoArquivoFormatado(
+                    stat.size
+                ),
+            paginas:
+                Number(
+                    paginas ||
+                    0
+                ),
+            mantidos:
+                rotacao.mantidos,
+            removidos:
+                rotacao.removidos
+        };
+
+        console.log(
+            `[BACKUP] Concluído: ${nomeArquivo} (${resultado.tamanho}) • integridade OK.`
+        );
+
+        return resultado;
+
+    } catch (error) {
+
+        console.error(
+            "[BACKUP] Erro ao criar backup:",
+            error
+        );
+
+        return {
+            sucesso:
+                false,
+            ocupado:
+                false,
+            erro:
+                error
+        };
+
+    } finally {
+
+        backupEmAndamento =
+            false;
+    }
+}
+
 
 db.exec(`
     CREATE TABLE IF NOT EXISTS clientes (
@@ -5066,6 +5435,51 @@ client.once("clientReady", async () => {
     console.log(
         `[MANUTENÇÃO] Estado atual: ${obterModoManutencao() ? "ATIVADA" : "DESATIVADA"}.`
     );
+    console.log(
+        `[BACKUP] Banco atual: ${MERCADO_PAGO_TEST_MODE ? "TESTE" : "PRODUÇÃO"} • intervalo: ${BACKUP_INTERVAL_HOURS}h • retenção: ${BACKUP_KEEP}.`
+    );
+    console.log(
+        `[BACKUP] Pasta: ${BACKUP_DIR}`
+    );
+
+    try {
+
+        const backupInicial =
+            await criarBackupBanco(
+                "startup"
+            );
+
+        if (
+            !backupInicial.sucesso &&
+            !backupInicial.ocupado
+        ) {
+
+            console.warn(
+                "[BACKUP] O backup inicial falhou, mas o bot continuará funcionando."
+            );
+        }
+
+        setInterval(
+            async () => {
+
+                await criarBackupBanco(
+                    "automatico"
+                );
+
+            },
+            BACKUP_INTERVAL_HOURS *
+            60 *
+            60 *
+            1000
+        );
+
+    } catch (error) {
+
+        console.error(
+            "[BACKUP] Erro ao iniciar rotina automática:",
+            error
+        );
+    }
 
     try {
 
@@ -5218,6 +5632,10 @@ client.once("clientReady", async () => {
         new SlashCommandBuilder()
             .setName("vendas")
             .setDescription("Cria ou atualiza o painel fixo de vendas"),
+
+        new SlashCommandBuilder()
+            .setName("backup")
+            .setDescription("Cria um backup manual do banco de dados"),
 
         new SlashCommandBuilder()
             .setName("manutencao")
@@ -6069,6 +6487,95 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
     }
+
+    // =========================================
+    // BACKUP MANUAL DO BANCO
+    // =========================================
+
+    if (
+        interaction.isChatInputCommand() &&
+        interaction.commandName ===
+            "backup"
+    ) {
+
+        if (
+            !interaction.member.roles.cache.has(
+                process.env.STAFF_ROLE_ID
+            )
+        ) {
+
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode criar backups.",
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        await interaction.deferReply({
+            flags:
+                MessageFlags.Ephemeral
+        });
+
+        const resultado =
+            await criarBackupBanco(
+                `manual:${interaction.user.id}`
+            );
+
+        if (
+            resultado.ocupado
+        ) {
+
+            await interaction.editReply({
+                content:
+                    "<:ampulheta:1549129208557469786> Já existe um backup em andamento. Aguarde ele terminar."
+            });
+
+            return;
+        }
+
+        if (
+            !resultado.sucesso
+        ) {
+
+            await interaction.editReply({
+                content:
+                    `<:x_:1549124126575165533> Não consegui criar o backup${resultado.erro?.message ? `: ${resultado.erro.message}` : "."}`
+            });
+
+            return;
+        }
+
+        await enviarLogStaff({
+            guild:
+                interaction.guild,
+            staff:
+                interaction.user,
+            titulo:
+                "Backup manual criado",
+            emoji:
+                "<:cadeado:1549128145381367949>",
+            descricao:
+                `> **Arquivo:** \`${resultado.nomeArquivo}\`\n` +
+                `> **Tamanho:** ${resultado.tamanho}\n` +
+                `> **Integridade:** OK\n` +
+                `> **Banco:** ${MERCADO_PAGO_TEST_MODE ? "Teste" : "Produção"}`
+        });
+
+        await interaction.editReply({
+            content:
+                "<a:greenverification:1548192162653536336> **Backup criado com sucesso.**\n\n" +
+                `> **Arquivo:** \`${resultado.nomeArquivo}\`\n` +
+                `> **Tamanho:** ${resultado.tamanho}\n` +
+                `> **Integridade:** OK\n` +
+                `> **Backups mantidos:** até ${BACKUP_KEEP}`
+        });
+
+        return;
+    }
+
 
     // =========================================
     // PAINEL FIXO DE VENDAS

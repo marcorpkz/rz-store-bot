@@ -1,12 +1,9 @@
-
-# dependencias
 node_modules
 
-# variaveis privadas
 .env
-assets
 
-# Banco SQLite
 *.db
 *.db-shm
 *.db-wal
+
+backups/

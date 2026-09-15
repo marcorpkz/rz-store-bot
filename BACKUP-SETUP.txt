@@ -1,0 +1,21 @@
+RZ STORE - BACKUP SQLITE
+
+O sistema funciona sem adicionar nada ao .env.
+
+Padrões:
+BACKUP_INTERVAL_HOURS=6
+BACKUP_KEEP=30
+BACKUP_DIR=backups
+
+Opcionalmente, adicione ao .env:
+
+BACKUP_INTERVAL_HOURS=6
+BACKUP_KEEP=30
+BACKUP_DIR=backups
+
+- Cria um backup ao iniciar o bot.
+- Cria backups automáticos no intervalo configurado.
+- Mantém somente os N backups mais recentes.
+- Separa automaticamente rz-store-test.db de rz-store.db.
+- Valida cada cópia com PRAGMA integrity_check.
+- /backup cria uma cópia manual imediatamente (somente staff).
