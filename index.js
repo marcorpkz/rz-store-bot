@@ -104,6 +104,19 @@ db.exec(`
         criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS pedidos_abertos (
+        channel_id TEXT PRIMARY KEY,
+        discord_id TEXT NOT NULL,
+        quantidade INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'aberto',
+        order_id TEXT,
+        criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        encerrado_em TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_pedidos_abertos_status
+    ON pedidos_abertos(status);
+
     CREATE TABLE IF NOT EXISTS cupons (
         codigo TEXT PRIMARY KEY,
         desconto_percentual INTEGER NOT NULL,
@@ -267,6 +280,18 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
 
+function obterPrazoExpiracaoPedidoMinutos() {
+    const configurado = Number(
+        process.env.PEDIDO_EXPIRA_MINUTOS || 30
+    );
+
+    if (!Number.isFinite(configurado) || configurado < 1) {
+        return 30;
+    }
+
+    return Math.floor(configurado);
+}
+
 async function criarCobrancaPix({
     valorCentavos,
     descricao,
@@ -411,6 +436,75 @@ async function criarCobrancaPix({
 
 
 
+
+async function cancelarOrderMercadoPago(orderId) {
+    const accessToken =
+        process.env.MERCADO_PAGO_ACCESS_TOKEN?.trim();
+
+    if (!accessToken) {
+        throw new Error(
+            "MERCADO_PAGO_ACCESS_TOKEN não foi encontrado no .env."
+        );
+    }
+
+    const resposta = await fetch(
+        `https://api.mercadopago.com/v1/orders/${encodeURIComponent(orderId)}/cancel`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${accessToken}`,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-Idempotency-Key": randomUUID()
+            }
+        }
+    );
+
+    const texto = await resposta.text();
+
+    let dados;
+
+    try {
+        dados = JSON.parse(texto);
+    } catch {
+        dados = { raw_response: texto };
+    }
+
+    if (!resposta.ok) {
+        const detalhe =
+            dados?.message ||
+            dados?.error ||
+            dados?.status_detail ||
+            JSON.stringify(dados);
+
+        const erro = new Error(
+            `Mercado Pago retornou HTTP ${resposta.status} ao cancelar a order: ${detalhe}`
+        );
+
+        erro.status = resposta.status;
+        erro.mercadoPago = dados;
+
+        throw erro;
+    }
+
+    return dados;
+}
+
+function orderMercadoPagoAprovada(order) {
+    const pagamento =
+        order?.transactions?.payments?.[0];
+
+    return (
+        (
+            order?.status === "processed" &&
+            order?.status_detail === "accredited"
+        ) ||
+        (
+            pagamento?.status === "processed" &&
+            pagamento?.status_detail === "accredited"
+        )
+    );
+}
 
 function validarAssinaturaMercadoPago({
     xSignature,
@@ -1012,6 +1106,1114 @@ function obterQuantidadeEstoque() {
 }
 
 
+function obterRobuxPedidosEmAberto(
+    excluirChannelId = null
+) {
+
+    let linha;
+
+    if (excluirChannelId) {
+
+        linha =
+            db.prepare(`
+                SELECT
+                    COALESCE(
+                        SUM(quantidade),
+                        0
+                    ) AS total
+                FROM pedidos_abertos
+                WHERE
+                    status = 'aberto'
+                    AND channel_id <> ?
+            `).get(
+                excluirChannelId
+            );
+
+    } else {
+
+        linha =
+            db.prepare(`
+                SELECT
+                    COALESCE(
+                        SUM(quantidade),
+                        0
+                    ) AS total
+                FROM pedidos_abertos
+                WHERE status = 'aberto'
+            `).get();
+    }
+
+    return Number(
+        linha?.total || 0
+    );
+}
+
+
+function obterEstoqueDisponivel(
+    excluirChannelId = null
+) {
+
+    return Math.max(
+        0,
+        obterQuantidadeEstoque() -
+        obterRobuxPedidosEmAberto(
+            excluirChannelId
+        )
+    );
+}
+
+
+function obterLimiteMaximoPedido(
+    excluirChannelId = null
+) {
+
+    const disponivel =
+        obterEstoqueDisponivel(
+            excluirChannelId
+        );
+
+    return disponivel >= 200
+        ? Math.floor(
+            disponivel /
+            2
+        )
+        : disponivel;
+}
+
+
+function validarLimiteMaximoPedido({
+    quantidade,
+    excluirChannelId = null
+}) {
+
+    const quantidadeNumero =
+        Number(
+            quantidade
+        );
+
+    const disponivel =
+        obterEstoqueDisponivel(
+            excluirChannelId
+        );
+
+    const limiteAplicavel =
+        disponivel >= 200
+            ? Math.floor(
+                disponivel /
+                2
+            )
+            : disponivel;
+
+    if (
+        !Number.isInteger(
+            quantidadeNumero
+        ) ||
+        quantidadeNumero <= 0
+    ) {
+        return {
+            valido: false,
+            motivo:
+                "Quantidade de Robux inválida.",
+            limite:
+                limiteAplicavel,
+            disponivel
+        };
+    }
+
+    if (
+        quantidadeNumero >
+        limiteAplicavel
+    ) {
+        return {
+            valido: false,
+            motivo:
+                `Para manter Robux disponíveis para outros clientes, cada pedido pode usar no máximo **50% do estoque disponível**.\n\n` +
+                `> <:greenrbx:1548088739677470881> **Disponível agora:** ${formatarRobux(disponivel)} Robux\n` +
+                `> <:greencart:1548089836647485591> **Máximo por pedido:** ${formatarRobux(limiteAplicavel)} Robux`,
+            limite:
+                limiteAplicavel,
+            disponivel
+        };
+    }
+
+    return {
+        valido: true,
+        limite:
+            limiteAplicavel,
+        disponivel
+    };
+}
+
+
+function reservarPedidoEmAberto({
+    channelId,
+    discordId,
+    quantidade
+}) {
+
+    const quantidadeNumero =
+        Number(
+            quantidade
+        );
+
+    if (
+        !channelId ||
+        !discordId ||
+        !Number.isInteger(
+            quantidadeNumero
+        ) ||
+        quantidadeNumero <= 0
+    ) {
+        throw new Error(
+            "Dados inválidos para registrar o pedido em aberto."
+        );
+    }
+
+    db.exec(
+        "BEGIN IMMEDIATE"
+    );
+
+    try {
+
+        const existente =
+            db.prepare(`
+                SELECT
+                    status,
+                    quantidade
+                FROM pedidos_abertos
+                WHERE channel_id = ?
+            `).get(
+                channelId
+            );
+
+        if (
+            existente?.status ===
+            "aberto"
+        ) {
+
+            const estoqueTotal =
+                obterQuantidadeEstoque();
+
+            const pedidosEmAberto =
+                obterRobuxPedidosEmAberto();
+
+            db.exec(
+                "COMMIT"
+            );
+
+            return {
+                reservado: true,
+                estoqueTotal,
+                pedidosEmAberto,
+                disponivel:
+                    Math.max(
+                        0,
+                        estoqueTotal -
+                        pedidosEmAberto
+                    )
+            };
+        }
+
+        const estoqueTotal =
+            obterQuantidadeEstoque();
+
+        const pedidosAntes =
+            obterRobuxPedidosEmAberto();
+
+        const disponivelAntes =
+            Math.max(
+                0,
+                estoqueTotal -
+                pedidosAntes
+            );
+
+        const limitePedido =
+            disponivelAntes >= 200
+                ? Math.floor(
+                    disponivelAntes /
+                    2
+                )
+                : disponivelAntes;
+
+        if (
+            quantidadeNumero >
+            disponivelAntes ||
+            quantidadeNumero >
+            limitePedido
+        ) {
+
+            db.exec(
+                "ROLLBACK"
+            );
+
+            return {
+                reservado: false,
+                estoqueTotal,
+                pedidosEmAberto:
+                    pedidosAntes,
+                disponivel:
+                    disponivelAntes,
+                limite:
+                    limitePedido,
+                motivo:
+                    quantidadeNumero >
+                    limitePedido
+                        ? "limite_metade"
+                        : "estoque"
+            };
+        }
+
+        db.prepare(`
+            INSERT INTO pedidos_abertos (
+                channel_id,
+                discord_id,
+                quantidade,
+                status
+            )
+            VALUES (?, ?, ?, 'aberto')
+
+            ON CONFLICT(channel_id)
+            DO UPDATE SET
+                discord_id =
+                    excluded.discord_id,
+                quantidade =
+                    excluded.quantidade,
+                status =
+                    'aberto',
+                order_id =
+                    NULL,
+                criado_em =
+                    CURRENT_TIMESTAMP,
+                encerrado_em =
+                    NULL
+        `).run(
+            channelId,
+            discordId,
+            quantidadeNumero
+        );
+
+        const pedidosDepois =
+            pedidosAntes +
+            quantidadeNumero;
+
+        db.exec(
+            "COMMIT"
+        );
+
+        return {
+            reservado: true,
+            estoqueTotal,
+            pedidosEmAberto:
+                pedidosDepois,
+            disponivel:
+                Math.max(
+                    0,
+                    estoqueTotal -
+                    pedidosDepois
+                )
+        };
+
+    } catch (error) {
+
+        try {
+            db.exec(
+                "ROLLBACK"
+            );
+        } catch {}
+
+        throw error;
+    }
+}
+
+
+function obterPedidoAbertoPorCanal(channelId) {
+    if (!channelId) {
+        return null;
+    }
+
+    return db.prepare(`
+        SELECT
+            channel_id,
+            discord_id,
+            quantidade,
+            status,
+            order_id,
+            criado_em,
+            CAST(strftime('%s', criado_em) AS INTEGER) AS criado_unix
+        FROM pedidos_abertos
+        WHERE channel_id = ?
+    `).get(channelId) || null;
+}
+
+function pedidoAbertoExpirou(pedido) {
+    if (!pedido || pedido.status !== "aberto") {
+        return false;
+    }
+
+    const criadoUnix = Number(pedido.criado_unix);
+
+    if (!Number.isFinite(criadoUnix)) {
+        return false;
+    }
+
+    const expiraUnix =
+        calcularExpiracaoUnixPedido(
+            pedido
+        );
+
+    if (!expiraUnix) {
+        return false;
+    }
+
+    return (
+        Math.floor(
+            Date.now() /
+            1000
+        ) >=
+        expiraUnix
+    );
+}
+
+function encerrarPedidoEmAberto(
+    channelId,
+    status = "cancelado",
+    orderId = null
+) {
+
+    if (!channelId) {
+        return false;
+    }
+
+    const resultado =
+        db.prepare(`
+            UPDATE pedidos_abertos
+            SET
+                status = ?,
+                order_id =
+                    COALESCE(
+                        ?,
+                        order_id
+                    ),
+                encerrado_em =
+                    CURRENT_TIMESTAMP
+            WHERE
+                channel_id = ?
+                AND status = 'aberto'
+        `).run(
+            status,
+            orderId,
+            channelId
+        );
+
+    return Number(
+        resultado.changes
+    ) > 0;
+}
+
+
+async function reconciliarPedidosEmAberto(
+    guild
+) {
+
+    try {
+
+        const canais =
+            await guild.channels.fetch();
+
+        const pedidos =
+            db.prepare(`
+                SELECT channel_id
+                FROM pedidos_abertos
+                WHERE status = 'aberto'
+            `).all();
+
+        for (
+            const pedido
+            of pedidos
+        ) {
+
+            if (
+                !canais.has(
+                    pedido.channel_id
+                )
+            ) {
+
+                encerrarPedidoEmAberto(
+                    pedido.channel_id,
+                    "cancelado"
+                );
+            }
+        }
+
+    } catch (error) {
+
+        console.error(
+            "[ESTOQUE] Erro ao reconciliar pedidos em aberto:",
+            error
+        );
+    }
+}
+
+
+const pedidosSendoExpirados = new Set();
+
+const timersExpiracaoPedidos =
+    new Map();
+
+
+function limparTimerExpiracaoPedido(
+    channelId
+) {
+
+    const timer =
+        timersExpiracaoPedidos.get(
+            channelId
+        );
+
+    if (timer) {
+        clearTimeout(
+            timer
+        );
+
+        timersExpiracaoPedidos.delete(
+            channelId
+        );
+    }
+}
+
+
+function calcularExpiracaoUnixPedido(
+    pedido
+) {
+
+    const criadoUnix =
+        Number(
+            pedido?.criado_unix
+        );
+
+    if (
+        !Number.isFinite(
+            criadoUnix
+        )
+    ) {
+        return null;
+    }
+
+    return (
+        criadoUnix +
+        obterPrazoExpiracaoPedidoMinutos() *
+        60
+    );
+}
+
+
+function agendarExpiracaoPedido(
+    guild,
+    channelId
+) {
+
+    limparTimerExpiracaoPedido(
+        channelId
+    );
+
+    const pedido =
+        obterPedidoAbertoPorCanal(
+            channelId
+        );
+
+    if (
+        !pedido ||
+        pedido.status !==
+            "aberto"
+    ) {
+        return false;
+    }
+
+    const expiraUnix =
+        calcularExpiracaoUnixPedido(
+            pedido
+        );
+
+    if (!expiraUnix) {
+        return false;
+    }
+
+    const agoraUnix =
+        Math.floor(
+            Date.now() /
+            1000
+        );
+
+    const atrasoMs =
+        Math.max(
+            1000,
+            (
+                expiraUnix -
+                agoraUnix
+            ) *
+            1000
+        );
+
+    const timer =
+        setTimeout(
+            async () => {
+
+                timersExpiracaoPedidos.delete(
+                    channelId
+                );
+
+                try {
+
+                    await processarExpiracaoPedido(
+                        guild,
+                        pedido
+                    );
+
+                } catch (error) {
+
+                    console.error(
+                        `[EXPIRAÇÃO] Erro no timer do pedido ${channelId}:`,
+                        error
+                    );
+                }
+
+            },
+            atrasoMs
+        );
+
+    timersExpiracaoPedidos.set(
+        channelId,
+        timer
+    );
+
+    console.log(
+        `[EXPIRAÇÃO] Pedido ${channelId} agendado para expirar em ${Math.ceil(atrasoMs / 1000)}s.`
+    );
+
+    return true;
+}
+
+
+async function agendarTodosPedidosEmAberto(
+    guild
+) {
+
+    const pedidos =
+        db.prepare(`
+            SELECT
+                channel_id
+            FROM pedidos_abertos
+            WHERE status = 'aberto'
+        `).all();
+
+    for (
+        const pedido
+        of pedidos
+    ) {
+
+        agendarExpiracaoPedido(
+            guild,
+            pedido.channel_id
+        );
+    }
+
+    console.log(
+        `[EXPIRAÇÃO] ${pedidos.length} pedido(s) em aberto agendado(s).`
+    );
+}
+
+
+async function enviarLogPedidoExpirado({
+    guild,
+    pedido,
+    channel,
+    user,
+    orderId,
+    orderCancelada,
+    valorCentavos
+}) {
+    const canalLogsId =
+        process.env.CANAL_LOGS_PEDIDOS_EXPIRADOS_ID ||
+        process.env.CANAL_LOGS_COMPRAS_ID;
+
+    if (!canalLogsId) {
+        return;
+    }
+
+    try {
+        const canalLogs =
+            await guild.channels.fetch(canalLogsId);
+
+        if (!canalLogs || !canalLogs.isTextBased()) {
+            return;
+        }
+
+        const valorFormatado =
+            Number.isInteger(valorCentavos) &&
+            valorCentavos > 0
+                ? (valorCentavos / 100).toLocaleString(
+                    "pt-BR",
+                    {
+                        style: "currency",
+                        currency: "BRL"
+                    }
+                )
+                : "Não identificado";
+
+        const embed =
+            new EmbedBuilder()
+                .setColor("#00db0f")
+                .setTitle(
+                    "<:ampulheta:1549129208557469786> Pedido expirado"
+                )
+                .setDescription(
+                    "Um pedido foi encerrado automaticamente porque o prazo para pagamento terminou.\n\n" +
+                    `> <:cliente:1548196941102317568> **Cliente:** ${user ? `${user}` : `<@${pedido.discord_id}>`}\n` +
+                    `> **ID do cliente:** \`${pedido.discord_id}\`\n` +
+                    `> <:greenrbx:1548088739677470881> **Quantidade:** ${formatarRobux(pedido.quantidade)} Robux\n` +
+                    `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n` +
+                    `> <:ampulheta:1549129208557469786> **Prazo:** ${obterPrazoExpiracaoPedidoMinutos()} minutos\n` +
+                    `> **Ticket:** ${channel ? `${channel}` : `\`${pedido.channel_id}\``}\n` +
+                    `> **Order Mercado Pago:** ${orderId ? `\`${orderId}\`` : "Nenhuma cobrança gerada"}\n` +
+                    `> **Cobrança cancelada:** ${orderId ? (orderCancelada ? "Sim" : "Já estava encerrada") : "Não se aplica"}\n\n` +
+                    "Os Robux do pedido voltaram a ficar disponíveis no estoque."
+                )
+                .setFooter({
+                    text: "RZ Store • Pedidos expirados"
+                })
+                .setTimestamp();
+
+        if (user) {
+            embed.setThumbnail(
+                user.displayAvatarURL()
+            );
+        }
+
+        await canalLogs.send({
+            embeds: [embed]
+        });
+
+    } catch (error) {
+        console.error(
+            "[EXPIRAÇÃO] Erro ao enviar log:",
+            error
+        );
+    }
+}
+
+async function enviarDmPedidoExpirado({
+    user,
+    pedido,
+    orderId
+}) {
+    if (!user) {
+        return false;
+    }
+
+    try {
+        const embed =
+            new EmbedBuilder()
+                .setColor("#00db0f")
+                .setTitle(
+                    "<:ampulheta:1549129208557469786> Seu pedido expirou"
+                )
+                .setDescription(
+                    `O prazo de **${obterPrazoExpiracaoPedidoMinutos()} minutos** para pagamento do seu pedido na **RZ Store** terminou.\n\n` +
+                    `> <:greenrbx:1548088739677470881> **Pedido:** ${formatarRobux(pedido.quantidade)} Robux\n` +
+                    (
+                        orderId
+                            ? "> <:pix:1548090281402966107> A cobrança PIX pendente foi encerrada.\n"
+                            : ""
+                    ) +
+                    "\nOs Robux que estavam separados para o seu pedido foram liberados novamente para o estoque.\n\n" +
+                    "<a:greensparkles:1548099963051843695> Se ainda quiser comprar, é só iniciar um novo pedido na **RZ Store**."
+                )
+                .setFooter({
+                    text: "RZ Store • Pedido expirado"
+                })
+                .setTimestamp();
+
+        await user.send({
+            embeds: [embed]
+        });
+
+        return true;
+
+    } catch (error) {
+        console.warn(
+            `[EXPIRAÇÃO] Não foi possível enviar DM para ${pedido.discord_id}:`,
+            error?.message || error
+        );
+
+        return false;
+    }
+}
+
+async function processarExpiracaoPedido(
+    guild,
+    pedidoInicial
+) {
+    const channelId =
+        pedidoInicial?.channel_id;
+
+    if (
+        !channelId ||
+        pedidosSendoExpirados.has(channelId)
+    ) {
+        return false;
+    }
+
+    pedidosSendoExpirados.add(channelId);
+
+    try {
+        const pedido =
+            obterPedidoAbertoPorCanal(channelId);
+
+        if (
+            !pedido ||
+            pedido.status !== "aberto" ||
+            !pedidoAbertoExpirou(pedido)
+        ) {
+            return false;
+        }
+
+        console.log(
+            `[EXPIRAÇÃO] Processando pedido expirado ${channelId}.`
+        );
+
+        let channel = null;
+
+        try {
+            channel =
+                await guild.channels.fetch(channelId);
+        } catch {}
+
+        const orderId =
+            pedido.order_id ||
+            channel?.topic
+                ?.match(/mp-order:([^|]+)/)?.[1]
+                ?.trim() ||
+            null;
+
+        let orderCancelada = false;
+
+        if (orderId) {
+            let orderAtual = null;
+
+            try {
+                orderAtual =
+                    await buscarOrderMercadoPago(orderId);
+            } catch (error) {
+                console.warn(
+                    `[EXPIRAÇÃO] Não consegui consultar a order ${orderId}:`,
+                    error?.message || error
+                );
+            }
+
+            if (
+                orderMercadoPagoAprovada(orderAtual)
+            ) {
+                await processarOrderAprovada(orderId);
+                return false;
+            }
+
+            const statusAtual =
+                String(orderAtual?.status || "")
+                    .toLowerCase();
+
+            const detalheAtual =
+                String(orderAtual?.status_detail || "")
+                    .toLowerCase();
+
+            const jaEncerrada =
+                [
+                    "canceled",
+                    "cancelled",
+                    "expired"
+                ].includes(statusAtual) ||
+                [
+                    "canceled",
+                    "cancelled",
+                    "expired"
+                ].includes(detalheAtual);
+
+            if (!jaEncerrada) {
+                try {
+                    await cancelarOrderMercadoPago(orderId);
+                    orderCancelada = true;
+
+                } catch (cancelError) {
+                    let orderDepois = null;
+
+                    try {
+                        orderDepois =
+                            await buscarOrderMercadoPago(orderId);
+                    } catch {}
+
+                    if (
+                        orderMercadoPagoAprovada(orderDepois)
+                    ) {
+                        await processarOrderAprovada(orderId);
+                        return false;
+                    }
+
+                    const statusDepois =
+                        String(orderDepois?.status || "")
+                            .toLowerCase();
+
+                    const detalheDepois =
+                        String(orderDepois?.status_detail || "")
+                            .toLowerCase();
+
+                    const seguraParaLiberar =
+                        [
+                            "canceled",
+                            "cancelled",
+                            "expired"
+                        ].includes(statusDepois) ||
+                        [
+                            "canceled",
+                            "cancelled",
+                            "expired"
+                        ].includes(detalheDepois);
+
+                    if (!seguraParaLiberar) {
+
+                        if (
+                            MERCADO_PAGO_TEST_MODE
+                        ) {
+
+                            console.warn(
+                                `[EXPIRAÇÃO] Sandbox: não foi possível confirmar o cancelamento da order ${orderId}. O pedido local será expirado mesmo assim para permitir o teste do fluxo.`,
+                                cancelError?.message ||
+                                cancelError
+                            );
+
+                        } else {
+
+                            console.error(
+                                `[EXPIRAÇÃO] A order ${orderId} não pôde ser cancelada. O estoque continuará reservado por segurança e o bot tentará novamente.`,
+                                cancelError
+                            );
+
+                            // Reagenda uma nova tentativa em 60 segundos.
+                            const retryTimer =
+                                setTimeout(
+                                    async () => {
+
+                                        timersExpiracaoPedidos.delete(
+                                            channelId
+                                        );
+
+                                        try {
+                                            await processarExpiracaoPedido(
+                                                guild,
+                                                pedido
+                                            );
+                                        } catch (retryError) {
+                                            console.error(
+                                                `[EXPIRAÇÃO] Falha na nova tentativa do pedido ${channelId}:`,
+                                                retryError
+                                            );
+                                        }
+
+                                    },
+                                    60 * 1000
+                                );
+
+                            timersExpiracaoPedidos.set(
+                                channelId,
+                                retryTimer
+                            );
+
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        const resultado =
+            db.prepare(`
+                UPDATE pedidos_abertos
+                SET
+                    status = 'expirado',
+                    order_id = COALESCE(?, order_id),
+                    encerrado_em = CURRENT_TIMESTAMP
+                WHERE
+                    channel_id = ?
+                    AND status = 'aberto'
+            `).run(
+                orderId,
+                channelId
+            );
+
+        if (Number(resultado.changes) === 0) {
+            return false;
+        }
+
+        limparTimerExpiracaoPedido(
+            channelId
+        );
+
+        await atualizarPainelEstoque(guild);
+
+        let user = null;
+
+        try {
+            user =
+                await client.users.fetch(
+                    pedido.discord_id
+                );
+        } catch {}
+
+        const valorCentavos =
+            Number(
+                channel?.topic
+                    ?.match(/valor-centavos:(\d+)/)?.[1]
+            );
+
+        await enviarLogPedidoExpirado({
+            guild,
+            pedido,
+            channel,
+            user,
+            orderId,
+            orderCancelada,
+            valorCentavos:
+                Number.isInteger(valorCentavos)
+                    ? valorCentavos
+                    : null
+        });
+
+        await enviarDmPedidoExpirado({
+            user,
+            pedido,
+            orderId
+        });
+
+        if (
+            channel &&
+            channel.isTextBased()
+        ) {
+            try {
+                const embedTicket =
+                    new EmbedBuilder()
+                        .setColor("#00db0f")
+                        .setTitle(
+                            "<:ampulheta:1549129208557469786> Pedido expirado"
+                        )
+                        .setDescription(
+                            `O prazo de **${obterPrazoExpiracaoPedidoMinutos()} minutos** para pagamento terminou.\n\n` +
+                            `> <:greenrbx:1548088739677470881> **${formatarRobux(pedido.quantidade)} Robux** foram liberados novamente para o estoque.\n\n` +
+                            "Este ticket será fechado automaticamente."
+                        )
+                        .setFooter({
+                            text: "RZ Store • Pedido expirado"
+                        })
+                        .setTimestamp();
+
+                await channel.send({
+                    content: `<@${pedido.discord_id}>`,
+                    embeds: [embedTicket],
+                    allowedMentions: {
+                        users: [pedido.discord_id]
+                    }
+                });
+
+                setTimeout(
+                    async () => {
+                        try {
+                            const canalAtual =
+                                await guild.channels.fetch(
+                                    channelId
+                                );
+
+                            if (canalAtual) {
+                                await canalAtual.delete(
+                                    "Pedido expirado automaticamente"
+                                );
+                            }
+                        } catch {}
+                    },
+                    10 * 1000
+                );
+
+            } catch (error) {
+                console.warn(
+                    "[EXPIRAÇÃO] Não foi possível avisar no ticket:",
+                    error?.message || error
+                );
+            }
+        }
+
+        console.log(
+            `[EXPIRAÇÃO] Pedido ${channelId} expirado e estoque liberado.`
+        );
+
+        return true;
+
+    } finally {
+        pedidosSendoExpirados.delete(channelId);
+    }
+}
+
+async function processarPedidosExpirados(
+    guild
+) {
+
+    const pedidos =
+        db.prepare(`
+            SELECT
+                channel_id,
+                discord_id,
+                quantidade,
+                status,
+                order_id,
+                criado_em,
+                CAST(
+                    strftime(
+                        '%s',
+                        criado_em
+                    )
+                    AS INTEGER
+                ) AS criado_unix
+            FROM pedidos_abertos
+            WHERE status = 'aberto'
+            ORDER BY criado_em ASC
+        `).all();
+
+    for (
+        const pedido
+        of pedidos
+    ) {
+
+        if (
+            !pedidoAbertoExpirou(
+                pedido
+            )
+        ) {
+            continue;
+        }
+
+        try {
+
+            await processarExpiracaoPedido(
+                guild,
+                pedido
+            );
+
+        } catch (error) {
+
+            console.error(
+                `[EXPIRAÇÃO] Erro ao processar pedido ${pedido.channel_id}:`,
+                error
+            );
+        }
+    }
+}
+
+
 function formatarRobux(
     quantidade
 ) {
@@ -1021,6 +2223,215 @@ function formatarRobux(
     ).toLocaleString(
         "pt-BR"
     );
+}
+
+
+async function atualizarPainelEstoque(
+    guild,
+    {
+        mencionarEveryone = false
+    } = {}
+) {
+
+    const canalPublicoId =
+        process.env.CANAL_ESTOQUE_PUBLICO_ID;
+
+    if (!canalPublicoId) {
+        return {
+            atualizado: false,
+            motivo:
+                "CANAL_ESTOQUE_PUBLICO_ID não configurado."
+        };
+    }
+
+    try {
+
+        const canalPublico =
+            await guild.channels.fetch(
+                canalPublicoId
+            );
+
+        if (
+            !canalPublico ||
+            !canalPublico.isTextBased()
+        ) {
+            throw new Error(
+                "O canal de estoque configurado não é um canal de texto válido."
+            );
+        }
+
+        const estoqueTotal =
+            obterQuantidadeEstoque();
+
+        const pedidosEmAberto =
+            obterRobuxPedidosEmAberto();
+
+        const estoqueDisponivel =
+            Math.max(
+                0,
+                estoqueTotal -
+                pedidosEmAberto
+            );
+
+        const limiteMaximoPedido =
+            obterLimiteMaximoPedido();
+
+        const caminhoBanner =
+            path.join(
+                __dirname,
+                "assets",
+                "estoque",
+                "estoque.png"
+            );
+
+        const embed =
+            new EmbedBuilder()
+                .setColor(
+                    "#00db0f"
+                )
+                .setTitle(
+                    "<:greenrbx:1548088739677470881> Estoque disponível — RZ Store"
+                )
+                .setDescription(
+                    "Acompanhe abaixo o estoque de Robux da **RZ Store em tempo real**.\n\n" +
+                    `> <:greenrbx:1548088739677470881> **Estoque total:** ${formatarRobux(estoqueTotal)} Robux\n` +
+                    `> <:ampulheta:1549129208557469786> **Pedidos em aberto:** ${formatarRobux(pedidosEmAberto)} Robux\n` +
+                    `> <a:greenverification:1548192162653536336> **Disponível agora:** ${formatarRobux(estoqueDisponivel)} Robux\n` +
+                    `> <:greencart:1548089836647485591> **Máximo por pedido:** ${formatarRobux(limiteMaximoPedido)} Robux\n\n` +
+                    "<a:greensparkles:1548099963051843695> Cada pedido pode utilizar no máximo **50% do estoque disponível**. Este painel é atualizado automaticamente conforme novas compras, pagamentos e alterações no estoque."
+                )
+                .setImage(
+                    "attachment://estoque.png"
+                )
+                .setFooter({
+                    text:
+                        "RZ Store • Estoque em tempo real"
+                })
+                .setTimestamp();
+
+        const config =
+            db.prepare(`
+                SELECT valor
+                FROM configuracoes
+                WHERE chave =
+                    'painel_estoque_message_id'
+            `).get();
+
+        let mensagem = null;
+
+        if (
+            config?.valor
+        ) {
+
+            try {
+
+                mensagem =
+                    await canalPublico.messages.fetch(
+                        config.valor
+                    );
+
+            } catch {
+
+                mensagem =
+                    null;
+            }
+        }
+
+        if (mensagem) {
+
+            await mensagem.edit({
+                content:
+                    mensagem.content ||
+                    "",
+                embeds: [
+                    embed
+                ]
+            });
+
+            return {
+                atualizado: true,
+                criado: false,
+                mensagem,
+                canal:
+                    canalPublico,
+                estoqueTotal,
+                pedidosEmAberto,
+                estoqueDisponivel
+            };
+        }
+
+        const novaMensagem =
+            await canalPublico.send({
+                content:
+                    mencionarEveryone
+                        ? "@everyone"
+                        : undefined,
+                embeds: [
+                    embed
+                ],
+                files: [
+                    {
+                        attachment:
+                            caminhoBanner,
+                        name:
+                            "estoque.png"
+                    }
+                ],
+                allowedMentions:
+                    mencionarEveryone
+                        ? {
+                            parse: [
+                                "everyone"
+                            ]
+                        }
+                        : {
+                            parse: []
+                        }
+            });
+
+        db.prepare(`
+            INSERT INTO configuracoes (
+                chave,
+                valor
+            )
+            VALUES (
+                'painel_estoque_message_id',
+                ?
+            )
+
+            ON CONFLICT(chave)
+            DO UPDATE SET
+                valor =
+                    excluded.valor
+        `).run(
+            novaMensagem.id
+        );
+
+        return {
+            atualizado: true,
+            criado: true,
+            mensagem:
+                novaMensagem,
+            canal:
+                canalPublico,
+            estoqueTotal,
+            pedidosEmAberto,
+            estoqueDisponivel
+        };
+
+    } catch (error) {
+
+        console.error(
+            "[ESTOQUE] Erro ao atualizar painel público:",
+            error
+        );
+
+        return {
+            atualizado: false,
+            erro:
+                error
+        };
+    }
 }
 
 
@@ -1060,12 +2471,22 @@ function alterarEstoqueManual({
             tipo === "saida_manual"
         ) {
 
+            const pedidosEmAberto =
+                obterRobuxPedidosEmAberto();
+
+            const disponivel =
+                Math.max(
+                    0,
+                    estoqueAntes -
+                    pedidosEmAberto
+                );
+
             if (
                 quantidade >
-                estoqueAntes
+                disponivel
             ) {
                 throw new Error(
-                    `Não há Robux suficientes no estoque. Saldo atual: ${formatarRobux(estoqueAntes)} Robux.`
+                    `Não é possível remover essa quantidade. Há ${formatarRobux(pedidosEmAberto)} Robux em pedidos em aberto e apenas ${formatarRobux(disponivel)} Robux disponíveis.`
                 );
             }
 
@@ -1149,6 +2570,18 @@ function setarEstoqueManual({
 
         const estoqueAntes =
             obterQuantidadeEstoque();
+
+        const pedidosEmAberto =
+            obterRobuxPedidosEmAberto();
+
+        if (
+            quantidade <
+            pedidosEmAberto
+        ) {
+            throw new Error(
+                `Não é possível definir o estoque para ${formatarRobux(quantidade)} Robux porque existem ${formatarRobux(pedidosEmAberto)} Robux em pedidos em aberto.`
+            );
+        }
 
         const diferenca =
             quantidade -
@@ -1301,7 +2734,8 @@ function registrarCompraAprovada({
     produto,
     valorOriginalCentavos = null,
     descontoCentavos = 0,
-    cupomCodigo = null
+    cupomCodigo = null,
+    ticketChannelId = null
 }) {
 
     const quantidade =
@@ -1400,8 +2834,20 @@ function registrarCompraAprovada({
         const estoqueAntes =
             obterQuantidadeEstoque();
 
+        const pedidosOutros =
+            obterRobuxPedidosEmAberto(
+                ticketChannelId
+            );
+
+        const disponivelParaEstePedido =
+            Math.max(
+                0,
+                estoqueAntes -
+                pedidosOutros
+            );
+
         if (
-            estoqueAntes <
+            disponivelParaEstePedido <
             quantidade
         ) {
 
@@ -1449,6 +2895,24 @@ function registrarCompraAprovada({
             estoqueDepois,
             `compra:${orderId}`
         );
+
+        if (ticketChannelId) {
+
+            db.prepare(`
+                UPDATE pedidos_abertos
+                SET
+                    status = 'pago',
+                    order_id = ?,
+                    encerrado_em =
+                        CURRENT_TIMESTAMP
+                WHERE
+                    channel_id = ?
+                    AND status = 'aberto'
+            `).run(
+                orderId,
+                ticketChannelId
+            );
+        }
 
         db.prepare(`
             INSERT INTO compras (
@@ -1964,6 +3428,276 @@ async function atualizarCargoCliente({
 }
 
 
+async function encontrarMensagemPrincipalPedido(
+    ticket
+) {
+
+    const mensagemId =
+        ticket.topic
+            ?.match(
+                /ticket-msg:(\d+)/
+            )?.[1];
+
+    if (mensagemId) {
+
+        try {
+
+            return await ticket.messages.fetch(
+                mensagemId
+            );
+
+        } catch {}
+    }
+
+    // Compatibilidade com tickets criados antes de começarmos
+    // a salvar o ID da primeira mensagem no tópico.
+    try {
+
+        const mensagens =
+            await ticket.messages.fetch({
+                limit: 100
+            });
+
+        return (
+            mensagens.find(
+                mensagem =>
+                    mensagem.author?.id ===
+                        client.user.id &&
+                    mensagem.embeds?.[0]
+                        ?.title
+                        ?.includes(
+                            "Novo pedido — RZ Store"
+                        )
+            ) ||
+            null
+        );
+
+    } catch (error) {
+
+        console.warn(
+            `[PAGAMENTO] Não consegui procurar a mensagem principal do ticket ${ticket.id}:`,
+            error?.message ||
+            error
+        );
+
+        return null;
+    }
+}
+
+
+async function atualizarMensagemPrincipalPedidoPago(
+    ticket
+) {
+
+    const mensagem =
+        await encontrarMensagemPrincipalPedido(
+            ticket
+        );
+
+    if (!mensagem) {
+
+        console.warn(
+            `[PAGAMENTO] Mensagem principal do ticket ${ticket.id} não encontrada.`
+        );
+
+        return false;
+    }
+
+    try {
+
+        const embedOriginal =
+            mensagem.embeds?.[0];
+
+        if (!embedOriginal) {
+            return false;
+        }
+
+        const dadosEmbed =
+            embedOriginal.toJSON();
+
+        dadosEmbed.title =
+            "<:okk:1549125132906270851> Pedido pago — RZ Store";
+
+        const descricaoOriginal =
+            dadosEmbed.description ||
+            "";
+
+        const blocoStatusPendente =
+            /### <:ampulheta:1549129208557469786> Status\n> Aguardando pagamento\.\n> \*\*Prazo para pagar:\*\* <t:\d+:R>\n\nClique no botão \*\*Gerar PIX\*\* abaixo para criar sua cobrança\./;
+
+        const blocoStatusPago =
+            "### <a:greenverification:1548192162653536336> Status\n" +
+            "> **Pagamento confirmado.**\n\n" +
+            "Aguarde a equipe da RZ Store realizar a entrega.";
+
+        if (
+            blocoStatusPendente.test(
+                descricaoOriginal
+            )
+        ) {
+
+            dadosEmbed.description =
+                descricaoOriginal.replace(
+                    blocoStatusPendente,
+                    blocoStatusPago
+                );
+
+        } else {
+
+            // Fallback para qualquer pequena variação no texto.
+            dadosEmbed.description =
+                descricaoOriginal
+                    .replace(
+                        /### <:ampulheta:1549129208557469786> Status[\s\S]*$/,
+                        blocoStatusPago
+                    );
+        }
+
+        dadosEmbed.timestamp =
+            new Date().toISOString();
+
+        const componentes =
+            mensagem.components.map(
+                row => {
+
+                    const novaLinha =
+                        ActionRowBuilder.from(
+                            row
+                        );
+
+                    const novosComponentes =
+                        row.components.map(
+                            component => {
+
+                                if (
+                                    component.type === 2 &&
+                                    component.customId
+                                        ?.startsWith(
+                                            "gerar_pix_"
+                                        )
+                                ) {
+
+                                    return ButtonBuilder
+                                        .from(
+                                            component
+                                        )
+                                        .setLabel(
+                                            "Pagamento confirmado"
+                                        )
+                                        .setEmoji({
+                                            id:
+                                                "1548192162653536336",
+                                            name:
+                                                "greenverification",
+                                            animated:
+                                                true
+                                        })
+                                        .setStyle(
+                                            ButtonStyle.Success
+                                        )
+                                        .setDisabled(
+                                            true
+                                        );
+                                }
+
+                                return ButtonBuilder.from(
+                                    component
+                                );
+                            }
+                        );
+
+                    novaLinha.setComponents(
+                        novosComponentes
+                    );
+
+                    return novaLinha;
+                }
+            );
+
+        await mensagem.edit({
+            embeds: [
+                new EmbedBuilder(
+                    dadosEmbed
+                )
+            ],
+            components:
+                componentes
+        });
+
+        console.log(
+            `[PAGAMENTO] Mensagem principal do ticket ${ticket.id} atualizada para pago.`
+        );
+
+        return true;
+
+    } catch (error) {
+
+        console.error(
+            `[PAGAMENTO] Erro ao atualizar mensagem principal do ticket ${ticket.id}:`,
+            error
+        );
+
+        return false;
+    }
+}
+
+
+async function sincronizarMensagensPedidosPagos(
+    guild
+) {
+
+    try {
+
+        const canais =
+            await guild.channels.fetch();
+
+        const ticketsPagos =
+            canais.filter(
+                channel =>
+                    channel &&
+                    channel.type ===
+                        ChannelType.GuildText &&
+                    channel.parentId ===
+                        process.env.CATEGORY_TICKETS_ID &&
+                    channel.topic?.includes(
+                        "mp-status:accredited"
+                    )
+            );
+
+        for (
+            const ticket
+            of ticketsPagos.values()
+        ) {
+
+            limparTimerExpiracaoPedido(
+                ticket.id
+            );
+
+            await atualizarMensagemPrincipalPedidoPago(
+                ticket
+            );
+        }
+
+        if (
+            ticketsPagos.size >
+            0
+        ) {
+
+            console.log(
+                `[PAGAMENTO] ${ticketsPagos.size} ticket(s) pago(s) sincronizado(s) no startup.`
+            );
+        }
+
+    } catch (error) {
+
+        console.error(
+            "[PAGAMENTO] Erro ao sincronizar mensagens de pedidos pagos:",
+            error
+        );
+    }
+}
+
+
 async function processarOrderAprovada(orderId) {
 
     if (
@@ -2049,8 +3783,16 @@ async function processarOrderAprovada(orderId) {
             )
         ) {
 
+            limparTimerExpiracaoPedido(
+                ticket.id
+            );
+
+            await atualizarMensagemPrincipalPedidoPago(
+                ticket
+            );
+
             console.log(
-                `[WEBHOOK] Order ${orderId} já tinha sido confirmada no Discord.`
+                `[WEBHOOK] Order ${orderId} já tinha sido confirmada no Discord. Status visual sincronizado.`
             );
 
             return;
@@ -2179,7 +3921,9 @@ async function processarOrderAprovada(orderId) {
                     )
                         ? descontoCentavos
                         : 0,
-                cupomCodigo
+                cupomCodigo,
+                ticketChannelId:
+                    ticket.id
             });
 
         if (registro.semEstoque) {
@@ -2257,6 +4001,18 @@ async function processarOrderAprovada(orderId) {
             guild,
             registro.estoqueAntes,
             registro.estoqueDepois
+        );
+
+        limparTimerExpiracaoPedido(
+            ticket.id
+        );
+
+        await atualizarMensagemPrincipalPedidoPago(
+            ticket
+        );
+
+        await atualizarPainelEstoque(
+            guild
         );
 
         if (cupomCodigo) {
@@ -2550,6 +4306,66 @@ const ordersEmProcessamento = new Set();
 client.once("clientReady", async () => {
 
     console.log(`Bot online como ${client.user.tag}`);
+    console.log(
+        `[EXPIRAÇÃO] Prazo configurado: ${obterPrazoExpiracaoPedidoMinutos()} minuto(s).`
+    );
+
+    try {
+
+        const guildEstoque =
+            await client.guilds.fetch(
+                process.env.GUILD_ID
+            );
+
+        await reconciliarPedidosEmAberto(
+            guildEstoque
+        );
+
+        await atualizarPainelEstoque(
+            guildEstoque
+        );
+
+        await processarPedidosExpirados(
+            guildEstoque
+        );
+
+        await agendarTodosPedidosEmAberto(
+            guildEstoque
+        );
+
+        await sincronizarMensagensPedidosPagos(
+            guildEstoque
+        );
+
+        setInterval(
+            async () => {
+
+                await atualizarPainelEstoque(
+                    guildEstoque
+                );
+
+            },
+            10 * 60 * 1000
+        );
+
+        setInterval(
+            async () => {
+
+                await processarPedidosExpirados(
+                    guildEstoque
+                );
+
+            },
+            30 * 1000
+        );
+
+    } catch (error) {
+
+        console.error(
+            "[ESTOQUE] Não foi possível reconciliar pedidos em aberto:",
+            error
+        );
+    }
 
     const commands = [
         new SlashCommandBuilder()
@@ -2914,11 +4730,56 @@ async function enviarPixNoTicket(interaction, dados, valorCentavos) {
         `${topicoAtual} | mp-order:${order.id} | mp-payment:${payment?.id || "-"} | mp-status:${payment?.status || order.status || "pending"} | pix-msg:${mensagemPix.id}`
     );
 
+    db.prepare(`
+        UPDATE pedidos_abertos
+        SET order_id = ?
+        WHERE
+            channel_id = ?
+            AND status = 'aberto'
+    `).run(
+        order.id,
+        interaction.channel.id
+    );
+
     await interaction.editReply({
         content:
             "<:okk:1549125132906270851> PIX gerado com sucesso. Confira a cobrança acima."
     });
 }
+
+
+client.on(Events.ChannelDelete, async channel => {
+
+    try {
+
+        const pedidoFoiEncerrado =
+            encerrarPedidoEmAberto(
+                channel.id,
+                "cancelado"
+            );
+
+        limparTimerExpiracaoPedido(
+            channel.id
+        );
+
+        if (
+            pedidoFoiEncerrado &&
+            channel.guild
+        ) {
+
+            await atualizarPainelEstoque(
+                channel.guild
+            );
+        }
+
+    } catch (error) {
+
+        console.error(
+            "[ESTOQUE] Erro ao liberar pedido após exclusão do canal:",
+            error
+        );
+    }
+});
 
 
 client.on(Events.InteractionCreate, async interaction => {
@@ -3244,6 +5105,19 @@ client.on(Events.InteractionCreate, async interaction => {
             const estoqueAtual =
                 obterQuantidadeEstoque();
 
+            const pedidosEmAberto =
+                obterRobuxPedidosEmAberto();
+
+            const estoqueDisponivel =
+                Math.max(
+                    0,
+                    estoqueAtual -
+                    pedidosEmAberto
+                );
+
+            const limiteMaximoPedido =
+                obterLimiteMaximoPedido();
+
             const embedEstoque =
                 new EmbedBuilder()
                     .setColor(
@@ -3253,7 +5127,10 @@ client.on(Events.InteractionCreate, async interaction => {
                         "<:greenrbx:1548088739677470881> Estoque da RZ Store"
                     )
                     .setDescription(
-                        `> **Disponível:** ${formatarRobux(estoqueAtual)} Robux`
+                        `> <:greenrbx:1548088739677470881> **Estoque total:** ${formatarRobux(estoqueAtual)} Robux\n` +
+                        `> <:ampulheta:1549129208557469786> **Pedidos em aberto:** ${formatarRobux(pedidosEmAberto)} Robux\n` +
+                        `> <a:greenverification:1548192162653536336> **Disponível:** ${formatarRobux(estoqueDisponivel)} Robux\n` +
+                        `> <:greencart:1548089836647485591> **Máximo por pedido:** ${formatarRobux(limiteMaximoPedido)} Robux`
                     )
                     .setFooter({
                         text:
@@ -3294,94 +5171,38 @@ client.on(Events.InteractionCreate, async interaction => {
                 return;
             }
 
-            try {
+            await interaction.deferReply({
+                flags:
+                    MessageFlags.Ephemeral
+            });
 
-                const canalPublico =
-                    await interaction.guild.channels.fetch(
-                        canalPublicoId
-                    );
-
-                if (
-                    !canalPublico ||
-                    !canalPublico.isTextBased()
-                ) {
-                    throw new Error(
-                        "O canal configurado não é um canal de texto válido."
-                    );
-                }
-
-                const estoqueAtual =
-                    obterQuantidadeEstoque();
-
-                const caminhoBanner =
-                    path.join(
-                        __dirname,
-                        "assets",
-                        "estoque",
-                        "estoque.png"
-                    );
-
-                const embedPublico =
-                    new EmbedBuilder()
-                        .setColor(
-                            "#00db0f"
-                        )
-                        .setTitle(
-                            "<:greenrbx:1548088739677470881> Estoque da semana"
-                        )
-                        .setDescription(
-                            "Confira o estoque de Robux disponível para esta semana na **RZ Store**.\n\n" +
-                            `> <:greenrbx:1548088739677470881> **Estoque da semana:** ${formatarRobux(estoqueAtual)} Robux\n\n` +
-                            "Garanta seu pedido enquanto ainda temos Robux disponíveis. O estoque pode diminuir ao longo da semana conforme novas compras são realizadas."
-                        )
-                        .setImage(
-                            "attachment://estoque.png"
-                        )
-                        .setFooter({
-                            text:
-                                "RZ Store • Estoque semanal"
-                        })
-                        .setTimestamp();
-
-                await canalPublico.send({
-                    embeds: [
-                        embedPublico
-                    ],
-                    files: [
-                        {
-                            attachment:
-                                caminhoBanner,
-                            name:
-                                "estoque.png"
-                        }
-                    ],
-                    allowedMentions: {
-                        users: [],
-                        roles: []
+            const resultado =
+                await atualizarPainelEstoque(
+                    interaction.guild,
+                    {
+                        mencionarEveryone:
+                            true
                     }
-                });
-
-                await interaction.reply({
-                    content:
-                        `<:okk:1549125132906270851> Estoque anunciado com sucesso em ${canalPublico}.`,
-                    flags:
-                        MessageFlags.Ephemeral
-                });
-
-            } catch (error) {
-
-                console.error(
-                    "[ESTOQUE] Erro ao anunciar estoque:",
-                    error
                 );
 
-                await interaction.reply({
+            if (
+                !resultado.atualizado
+            ) {
+
+                await interaction.editReply({
                     content:
-                        `<:x_:1549124126575165533> Não consegui anunciar o estoque: ${error.message}`,
-                    flags:
-                        MessageFlags.Ephemeral
+                        `<:x_:1549124126575165533> Não consegui publicar o painel de estoque${resultado.erro?.message ? `: ${resultado.erro.message}` : "."}`
                 });
+
+                return;
             }
+
+            await interaction.editReply({
+                content:
+                    resultado.criado
+                        ? `<:okk:1549125132906270851> Painel de estoque criado em ${resultado.canal} e o **@everyone** foi marcado. A partir de agora ele será atualizado automaticamente.`
+                        : `<:okk:1549125132906270851> O painel de estoque em ${resultado.canal} já existia e foi atualizado. As próximas alterações também serão automáticas.`
+            });
 
             return;
         }
@@ -3405,6 +5226,10 @@ client.on(Events.InteractionCreate, async interaction => {
                         staffDiscordId:
                             interaction.user.id
                     });
+
+                await atualizarPainelEstoque(
+                    interaction.guild
+                );
 
                 await interaction.reply({
                     content:
@@ -3453,6 +5278,10 @@ client.on(Events.InteractionCreate, async interaction => {
                     resultado.estoqueDepois
                 );
             }
+
+            await atualizarPainelEstoque(
+                interaction.guild
+            );
 
             const acao =
                 tipo === "entrada"
@@ -4516,6 +6345,35 @@ client.on(Events.InteractionCreate, async interaction => {
                     "<:x_:1549124126575165533> Apenas o cliente deste ticket pode gerar o PIX.",
                 flags: MessageFlags.Ephemeral
             });
+
+            return;
+        }
+
+        const pedidoAberto =
+            obterPedidoAbertoPorCanal(
+                interaction.channel.id
+            );
+
+        if (
+            pedidoAberto &&
+            pedidoAbertoExpirou(
+                pedidoAberto
+            )
+        ) {
+            await interaction.reply({
+                content:
+                    "<:ampulheta:1549129208557469786> O prazo deste pedido terminou. O ticket está sendo encerrado.",
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            setImmediate(
+                () =>
+                    processarExpiracaoPedido(
+                        interaction.guild,
+                        pedidoAberto
+                    )
+            );
 
             return;
         }
@@ -6024,6 +7882,35 @@ client.on(Events.InteractionCreate, async interaction => {
                 return;
             }
 
+            const pedidoAberto =
+                obterPedidoAbertoPorCanal(
+                    interaction.channel.id
+                );
+
+            if (
+                pedidoAberto &&
+                pedidoAbertoExpirou(
+                    pedidoAberto
+                )
+            ) {
+                await interaction.reply({
+                    content:
+                        "<:ampulheta:1549129208557469786> O prazo deste pedido terminou. O ticket está sendo encerrado.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                setImmediate(
+                    () =>
+                        processarExpiracaoPedido(
+                            interaction.guild,
+                            pedidoAberto
+                        )
+                );
+
+                return;
+            }
+
             if (
                 interaction.channel.topic?.includes(
                     "mp-order:"
@@ -6292,7 +8179,26 @@ client.on(Events.InteractionCreate, async interaction => {
         100;
 
     const estoqueAtual =
-        obterQuantidadeEstoque();
+        obterEstoqueDisponivel();
+
+    const validacaoLimitePedido =
+        validarLimiteMaximoPedido({
+            quantidade
+        });
+
+    if (
+        !validacaoLimitePedido.valido
+    ) {
+
+        await interaction.update({
+            content:
+                `<:danger:1549129849904566392> ${validacaoLimitePedido.motivo}`,
+            embeds: [],
+            components: []
+        });
+
+        return;
+    }
 
     if (
         quantidade >
@@ -6414,6 +8320,48 @@ if (ticketExistente) {
 
         });
 
+        const reservaPedido =
+            reservarPedidoEmAberto({
+                channelId:
+                    ticket.id,
+                discordId:
+                    interaction.user.id,
+                quantidade
+            });
+
+        if (
+            !reservaPedido.reservado
+        ) {
+
+            await ticket.delete(
+                "Estoque indisponível durante a criação do pedido"
+            );
+
+            await interaction.update({
+                content:
+                    reservaPedido.motivo === "limite_metade"
+                        ? `<:danger:1549129849904566392> O estoque disponível mudou enquanto seu pedido estava sendo criado. Para manter vendas abertas, o máximo atual por pedido é **${formatarRobux(reservaPedido.limite)} Robux**.`
+                        : `<:danger:1549129849904566392> O estoque disponível mudou enquanto seu pedido estava sendo criado. Temos **${formatarRobux(reservaPedido.disponivel)} Robux** disponíveis agora.`,
+                embeds: [],
+                components: []
+            });
+
+            return;
+        }
+
+        await atualizarPainelEstoque(
+            guild
+        );
+
+        agendarExpiracaoPedido(
+            guild,
+            ticket.id
+        );
+
+        const prazoExpiracaoUnix =
+            Math.floor(Date.now() / 1000) +
+            obterPrazoExpiracaoPedidoMinutos() * 60;
+
         const embedTicket = new EmbedBuilder()
             .setColor("#00db0f")
             .setTitle(
@@ -6434,7 +8382,8 @@ if (ticketExistente) {
                 `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n\n` +
 
                 `### <:ampulheta:1549129208557469786> Status\n` +
-                `> Aguardando pagamento.\n\n` +
+                `> Aguardando pagamento.\n` +
+                `> **Prazo para pagar:** <t:${prazoExpiracaoUnix}:R>\n\n` +
 
                 `Clique no botão **Gerar PIX** abaixo para criar sua cobrança.`
             )
@@ -6464,11 +8413,16 @@ if (ticketExistente) {
                     .setStyle(ButtonStyle.Danger)
             );
 
-        await ticket.send({
-            content: `${interaction.user} <@&${process.env.STAFF_ROLE_ID}>`,
-            embeds: [embedTicket],
-            components: [botoesTicket]
-        });
+        const mensagemPedido =
+            await ticket.send({
+                content: `${interaction.user} <@&${process.env.STAFF_ROLE_ID}>`,
+                embeds: [embedTicket],
+                components: [botoesTicket]
+            });
+
+        await ticket.setTopic(
+            `${ticket.topic || ""} | ticket-msg:${mensagemPedido.id}`
+        );
 
         const embedCriado = new EmbedBuilder()
             .setColor("#00db0f")
@@ -6647,7 +8601,27 @@ if (ticketExistente) {
             }
 
             const estoqueAtual =
-                obterQuantidadeEstoque();
+                obterEstoqueDisponivel();
+
+            const validacaoLimitePedido =
+                validarLimiteMaximoPedido({
+                    quantidade:
+                        produto.robux
+                });
+
+            if (
+                !validacaoLimitePedido.valido
+            ) {
+
+                await interaction.update({
+                    content:
+                        `<:danger:1549129849904566392> ${validacaoLimitePedido.motivo}`,
+                    embeds: [],
+                    components: []
+                });
+
+                return;
+            }
 
             if (
                 produto.robux >
@@ -6772,6 +8746,49 @@ if (ticketExistente) {
 
                 });
 
+                const reservaPedido =
+                    reservarPedidoEmAberto({
+                        channelId:
+                            ticket.id,
+                        discordId:
+                            interaction.user.id,
+                        quantidade:
+                            produto.robux
+                    });
+
+                if (
+                    !reservaPedido.reservado
+                ) {
+
+                    await ticket.delete(
+                        "Estoque indisponível durante a criação do pedido"
+                    );
+
+                    await interaction.update({
+                        content:
+                            reservaPedido.motivo === "limite_metade"
+                                ? `<:danger:1549129849904566392> O estoque disponível mudou enquanto seu pedido estava sendo criado. Para manter vendas abertas, o máximo atual por pedido é **${formatarRobux(reservaPedido.limite)} Robux**.`
+                                : `<:danger:1549129849904566392> O estoque disponível mudou enquanto seu pedido estava sendo criado. Temos **${formatarRobux(reservaPedido.disponivel)} Robux** disponíveis agora.`,
+                        embeds: [],
+                        components: []
+                    });
+
+                    return;
+                }
+
+                await atualizarPainelEstoque(
+                    guild
+                );
+
+                agendarExpiracaoPedido(
+                    guild,
+                    ticket.id
+                );
+
+                const prazoExpiracaoUnix =
+                    Math.floor(Date.now() / 1000) +
+                    obterPrazoExpiracaoPedidoMinutos() * 60;
+
                 const embedTicketItem = new EmbedBuilder()
                     .setColor("#00db0f")
                     .setTitle("<:greencart:1548089836647485591> Novo pedido — RZ Store")
@@ -6791,7 +8808,8 @@ if (ticketExistente) {
                         `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n\n` +
 
                         `### <:ampulheta:1549129208557469786> Status\n` +
-                        `> Aguardando pagamento.\n\n` +
+                        `> Aguardando pagamento.\n` +
+                        `> **Prazo para pagar:** <t:${prazoExpiracaoUnix}:R>\n\n` +
 
                         `Clique no botão **Gerar PIX** abaixo para criar sua cobrança.`
                     )
@@ -6821,11 +8839,16 @@ if (ticketExistente) {
                             .setStyle(ButtonStyle.Danger)
                     );
 
-                await ticket.send({
-                    content: `${interaction.user} <@&${process.env.STAFF_ROLE_ID}>`,
-                    embeds: [embedTicketItem],
-                    components: [botoesTicketItem]
-                });
+                const mensagemPedido =
+                    await ticket.send({
+                        content: `${interaction.user} <@&${process.env.STAFF_ROLE_ID}>`,
+                        embeds: [embedTicketItem],
+                        components: [botoesTicketItem]
+                    });
+
+                await ticket.setTopic(
+                    `${ticket.topic || ""} | ticket-msg:${mensagemPedido.id}`
+                );
 
                 const embedCriadoItem = new EmbedBuilder()
                     .setColor("#00db0f")
@@ -6989,6 +9012,25 @@ if (ticketExistente) {
                 });
 
                 return;
+            }
+
+            const pedidoFoiEncerrado =
+                encerrarPedidoEmAberto(
+                    interaction.channel.id,
+                    "cancelado"
+                );
+
+            if (
+                pedidoFoiEncerrado
+            ) {
+
+                limparTimerExpiracaoPedido(
+                    interaction.channel.id
+                );
+
+                await atualizarPainelEstoque(
+                    interaction.guild
+                );
             }
 
             await interaction.update({
