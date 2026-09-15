@@ -22,6 +22,170 @@ const {
     MessageFlags
 } = require("discord.js");
 
+
+const {
+    MercadoPagoConfig,
+    Order
+} = require("mercadopago");
+
+const QRCode = require("qrcode");
+const { randomUUID } = require("crypto");
+
+const mercadoPagoClient = new MercadoPagoConfig({
+    accessToken: process.env.MERCADO_PAGO_ACCESS_TOKEN,
+    options: {
+        timeout: 5000
+    }
+});
+
+const mercadoPagoOrder = new Order(mercadoPagoClient);
+
+const MERCADO_PAGO_TEST_MODE =
+    process.env.MERCADO_PAGO_TEST_MODE === "true";
+
+async function criarCobrancaPix({
+    valorCentavos,
+    descricao,
+    discordUserId,
+    channelId,
+    payerEmail
+}) {
+
+    const valorPedido = valorCentavos / 100;
+
+    const accessToken =
+        process.env.MERCADO_PAGO_ACCESS_TOKEN?.trim();
+
+    if (!accessToken) {
+        throw new Error(
+            "MERCADO_PAGO_ACCESS_TOKEN não foi encontrado no .env."
+        );
+    }
+
+    // O teste oficial de PIX da API de Orders usa valores
+    // predefinidos. Mantemos o body igual ao exemplo oficial.
+    const body = MERCADO_PAGO_TEST_MODE
+        ? {
+            type: "online",
+            external_reference: "ext_ref_1234",
+            total_amount: "50.00",
+            payer: {
+                email: "test_user_br@testuser.com",
+                first_name: "APRO"
+            },
+            transactions: {
+                payments: [
+                    {
+                        amount: "50.00",
+                        payment_method: {
+                            id: "pix",
+                            type: "bank_transfer"
+                        }
+                    }
+                ]
+            }
+        }
+        : {
+            type: "online",
+            processing_mode: "automatic",
+            total_amount: valorPedido.toFixed(2),
+            external_reference:
+                `rzstore-${discordUserId}-${channelId}`,
+            payer: {
+                email: payerEmail
+            },
+            transactions: {
+                payments: [
+                    {
+                        amount: valorPedido.toFixed(2),
+                        payment_method: {
+                            id: "pix",
+                            type: "bank_transfer"
+                        }
+                    }
+                ]
+            }
+        };
+
+    const resposta = await fetch(
+        "https://api.mercadopago.com/v1/orders",
+        {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${accessToken}`,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-Idempotency-Key": randomUUID()
+            },
+            body: JSON.stringify(body)
+        }
+    );
+
+    const textoResposta = await resposta.text();
+
+    let order;
+
+    try {
+        order = JSON.parse(textoResposta);
+    } catch {
+        order = {
+            raw_response: textoResposta
+        };
+    }
+
+    if (!resposta.ok) {
+
+        console.error(
+            "Mercado Pago HTTP status:",
+            resposta.status
+        );
+
+        console.error(
+            "Mercado Pago body:",
+            order
+        );
+
+        const detalhe =
+            order?.message ||
+            order?.error ||
+            order?.status_detail ||
+            JSON.stringify(order);
+
+        const erro = new Error(
+            `Mercado Pago retornou HTTP ${resposta.status}: ${detalhe}`
+        );
+
+        erro.status = resposta.status;
+        erro.mercadoPago = order;
+
+        throw erro;
+    }
+
+    const payment =
+        order.transactions?.payments?.[0];
+
+    const paymentMethod =
+        payment?.payment_method;
+
+    if (!paymentMethod?.qr_code) {
+        throw new Error(
+            "Mercado Pago criou a order, mas não retornou o código PIX."
+        );
+    }
+
+    return {
+        order,
+        payment,
+        pixCopiaCola: paymentMethod.qr_code,
+        ticketUrl: paymentMethod.ticket_url,
+        valorPedido,
+        valorCobranca: MERCADO_PAGO_TEST_MODE
+            ? 50
+            : valorPedido
+    };
+}
+
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds
@@ -67,6 +231,169 @@ client.once("clientReady", async () => {
 
 });
 
+async function buscarOrderMercadoPago(orderId) {
+
+    const accessToken =
+        process.env.MERCADO_PAGO_ACCESS_TOKEN?.trim();
+
+    if (!accessToken) {
+        throw new Error(
+            "MERCADO_PAGO_ACCESS_TOKEN não foi encontrado no .env."
+        );
+    }
+
+    const resposta = await fetch(
+        `https://api.mercadopago.com/v1/orders/${orderId}`,
+        {
+            method: "GET",
+            headers: {
+                "Authorization": `Bearer ${accessToken}`,
+                "Accept": "application/json"
+            }
+        }
+    );
+
+    const textoResposta = await resposta.text();
+
+    let order;
+
+    try {
+        order = JSON.parse(textoResposta);
+    } catch {
+        order = {
+            raw_response: textoResposta
+        };
+    }
+
+    if (!resposta.ok) {
+
+        console.error(
+            "Erro ao consultar order do Mercado Pago:",
+            resposta.status,
+            order
+        );
+
+        throw new Error(
+            `Mercado Pago retornou HTTP ${resposta.status} ao consultar a order.`
+        );
+    }
+
+    return order;
+}
+
+
+async function enviarPixNoTicket(interaction, dados, valorCentavos) {
+
+    const {
+        order,
+        payment,
+        pixCopiaCola,
+        ticketUrl,
+        valorPedido,
+        valorCobranca
+    } = dados;
+
+    const qrBuffer = await QRCode.toBuffer(
+        pixCopiaCola,
+        {
+            type: "png",
+            width: 500,
+            margin: 2
+        }
+    );
+
+    const qrAttachment = new AttachmentBuilder(
+        qrBuffer,
+        {
+            name: "pix-qrcode.png"
+        }
+    );
+
+    const valorPedidoFormatado =
+        valorPedido.toLocaleString("pt-BR", {
+            style: "currency",
+            currency: "BRL"
+        });
+
+    const valorCobrancaFormatado =
+        valorCobranca.toLocaleString("pt-BR", {
+            style: "currency",
+            currency: "BRL"
+        });
+
+    let textoValor =
+        `**Valor:** ${valorPedidoFormatado}\n`;
+
+    if (MERCADO_PAGO_TEST_MODE) {
+        textoValor =
+            `**Valor do pedido:** ${valorPedidoFormatado}\n` +
+            `**Cobrança sandbox:** ${valorCobrancaFormatado}\n` +
+            `> 🧪 Ambiente de teste do Mercado Pago: o PIX de teste usa valor predefinido.\n`;
+    }
+
+    const embedPix = new EmbedBuilder()
+        .setColor("#00db0f")
+        .setTitle(
+            "<:pix:1548090281402966107> Pagamento via PIX"
+        )
+        .setDescription(
+            textoValor +
+            `**ID da order:** \`${order.id}\`\n` +
+            `**ID do pagamento:** \`${payment?.id || "-"}\`\n\n` +
+            "### PIX Copia e Cola\n" +
+            `\`\`\`\n${pixCopiaCola}\n\`\`\`\n` +
+            "### <:ampulheta:1549129208557469786> Status\n" +
+            "> Aguardando pagamento."
+        )
+        .setImage("attachment://pix-qrcode.png")
+        .setFooter({
+            text:
+                "RZ Store • Não pague duas vezes a mesma cobrança."
+        })
+        .setTimestamp();
+
+    const linhaBotoesPix =
+        new ActionRowBuilder();
+
+    if (ticketUrl) {
+        linhaBotoesPix.addComponents(
+            new ButtonBuilder()
+                .setLabel("Abrir página do PIX")
+                .setStyle(ButtonStyle.Link)
+                .setURL(ticketUrl)
+        );
+    }
+
+    linhaBotoesPix.addComponents(
+        new ButtonBuilder()
+            .setCustomId("copiar_pix")
+            .setLabel("Copiar PIX")
+            .setEmoji("📋")
+            .setStyle(ButtonStyle.Secondary)
+    );
+
+    const componentesPix = [linhaBotoesPix];
+
+    await interaction.channel.send({
+        embeds: [embedPix],
+        files: [qrAttachment],
+        components: componentesPix
+    });
+
+    const topicoAtual =
+        interaction.channel.topic || "";
+
+    await interaction.channel.setTopic(
+        `${topicoAtual} | mp-order:${order.id} | mp-payment:${payment?.id || "-"} | mp-status:${payment?.status || order.status || "pending"}`
+    );
+
+    await interaction.editReply({
+        content:
+            "<:okk:1549125132906270851> PIX gerado com sucesso. Confira a cobrança acima."
+    });
+}
+
+
 client.on(Events.InteractionCreate, async interaction => {
 
     // =========================================
@@ -77,6 +404,21 @@ client.on(Events.InteractionCreate, async interaction => {
         interaction.isChatInputCommand() &&
         interaction.commandName === "setupcomprar"
     ) {
+
+
+        // Apenas a equipe da RZ Store pode usar este comando
+        if (
+            !interaction.member.roles.cache.has(
+                process.env.STAFF_ROLE_ID
+            )
+        ) {
+            await interaction.reply({
+                content: "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode usar este comando.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
 
         const embed = new EmbedBuilder()
             .setColor("#00db0f")
@@ -347,6 +689,21 @@ client.on(Events.InteractionCreate, async interaction => {
         interaction.isChatInputCommand() &&
         interaction.commandName === "korblox"
     ) {
+
+
+        // Apenas a equipe da RZ Store pode usar este comando
+        if (
+            !interaction.member.roles.cache.has(
+                process.env.STAFF_ROLE_ID
+            )
+        ) {
+            await interaction.reply({
+                content: "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode usar este comando.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
 
         
 
@@ -703,11 +1060,414 @@ client.on(Events.InteractionCreate, async interaction => {
     }
 
 
+
+    // =========================================
+    // MODAL DO PIX (PRODUÇÃO)
+    // =========================================
+
+    if (
+        interaction.isModalSubmit() &&
+        interaction.customId.startsWith("modal_pix_")
+    ) {
+
+        const partes = interaction.customId.split("_");
+        const valorCentavos = Number(partes[2]);
+        const referencia = partes.slice(3).join("_");
+
+        const donoTicket = interaction.channel.topic
+            ?.match(/rzstore-user:(\d+)/)?.[1];
+
+        if (
+            !donoTicket ||
+            interaction.user.id !== donoTicket
+        ) {
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Apenas o cliente deste ticket pode gerar o PIX.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        if (
+            interaction.channel.topic?.includes(
+                "mp-order:"
+            )
+        ) {
+            await interaction.reply({
+                content:
+                    "<:danger:1549129849904566392> Já existe uma cobrança PIX gerada para este ticket.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        const email = interaction.fields
+            .getTextInputValue("pix_email")
+            .trim();
+
+        const emailValido =
+            /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+        if (!emailValido) {
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Digite um e-mail válido.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        if (
+            !Number.isInteger(valorCentavos) ||
+            valorCentavos <= 0
+        ) {
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> O valor desta cobrança é inválido.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        await interaction.deferReply({
+            flags: MessageFlags.Ephemeral
+        });
+
+        try {
+
+            let descricao = "RZ Store";
+
+            if (referencia.startsWith("robux-")) {
+                const quantidade = Number(
+                    referencia.replace("robux-", "")
+                );
+
+                descricao =
+                    `RZ Store - ${quantidade.toLocaleString("pt-BR")} Robux`;
+            }
+
+            if (referencia.startsWith("item-")) {
+                const item = referencia
+                    .replace("item-", "");
+
+                descricao =
+                    item === "korblox"
+                        ? "RZ Store - Korblox"
+                        : "RZ Store - Headless";
+            }
+
+            const dados = await criarCobrancaPix({
+                valorCentavos,
+                descricao,
+                discordUserId: interaction.user.id,
+                channelId: interaction.channel.id,
+                payerEmail: email
+            });
+
+            await enviarPixNoTicket(
+                interaction,
+                dados,
+                valorCentavos
+            );
+
+        } catch (error) {
+
+            console.error(
+                "Erro ao gerar PIX:",
+                error
+            );
+
+            console.error(
+                "Resposta Mercado Pago:",
+                error?.cause || error?.response || error
+            );
+
+            const mensagemMercadoPago =
+                error?.cause?.[0]?.description ||
+                error?.message ||
+                "Erro desconhecido.";
+
+            await interaction.editReply({
+                content:
+                    "<:x_:1549124126575165533> Não foi possível gerar o PIX.\n" +
+                    `Detalhe: \`${String(mensagemMercadoPago).slice(0, 500)}\``
+            });
+
+        }
+
+        return;
+    }
+
+
     // =========================================
     // BOTÕES
     // =========================================
 
     if (interaction.isButton()) {
+
+        // =========================================
+        // COPIAR PIX
+        // =========================================
+
+        if (
+            interaction.customId === "copiar_pix"
+        ) {
+
+            const donoTicket = interaction.channel.topic
+                ?.match(/rzstore-user:(\d+)/)?.[1];
+
+            const ehStaff =
+                interaction.member.roles.cache.has(
+                    process.env.STAFF_ROLE_ID
+                );
+
+            if (
+                !donoTicket ||
+                (
+                    interaction.user.id !== donoTicket &&
+                    !ehStaff
+                )
+            ) {
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Você não tem permissão para acessar o PIX deste ticket.",
+                    flags: MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            const orderId = interaction.channel.topic
+                ?.match(/mp-order:([A-Za-z0-9]+)/)?.[1];
+
+            if (!orderId) {
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Não encontrei a cobrança PIX deste ticket.",
+                    flags: MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            await interaction.deferReply({
+                flags: MessageFlags.Ephemeral
+            });
+
+            try {
+
+                const order =
+                    await buscarOrderMercadoPago(
+                        orderId
+                    );
+
+                const pagamento =
+                    order.transactions
+                        ?.payments?.[0];
+
+                const pixCopiaCola =
+                    pagamento
+                        ?.payment_method
+                        ?.qr_code;
+
+                if (!pixCopiaCola) {
+                    throw new Error(
+                        "A order não retornou o código PIX."
+                    );
+                }
+
+                // Envia SOMENTE o código para facilitar o "Copiar texto"
+                // no Discord mobile.
+                await interaction.editReply({
+                    content: pixCopiaCola
+                });
+
+            } catch (error) {
+
+                console.error(
+                    "Erro ao recuperar PIX:",
+                    error
+                );
+
+                await interaction.editReply({
+                    content:
+                        "<:x_:1549124126575165533> Não foi possível recuperar o PIX. Tente novamente."
+                });
+
+            }
+
+            return;
+        }
+
+
+        // =========================================
+        // GERAR PIX
+        // =========================================
+
+        if (
+            interaction.customId.startsWith(
+                "gerar_pix_"
+            )
+        ) {
+
+            const donoTicket = interaction.channel.topic
+                ?.match(/rzstore-user:(\d+)/)?.[1];
+
+            if (
+                !donoTicket ||
+                interaction.user.id !== donoTicket
+            ) {
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Apenas o cliente deste ticket pode gerar o PIX.",
+                    flags: MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            if (
+                interaction.channel.topic?.includes(
+                    "mp-order:"
+                )
+            ) {
+                await interaction.reply({
+                    content:
+                        "<:danger:1549129849904566392> Já existe uma cobrança PIX gerada para este ticket.",
+                    flags: MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            const dadosCustomId =
+                interaction.customId
+                    .replace("gerar_pix_", "");
+
+            const separador =
+                dadosCustomId.indexOf("_");
+
+            const valorCentavos = Number(
+                dadosCustomId.slice(0, separador)
+            );
+
+            const referencia =
+                dadosCustomId.slice(separador + 1);
+
+            if (
+                !Number.isInteger(valorCentavos) ||
+                valorCentavos <= 0
+            ) {
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> O valor desta cobrança é inválido.",
+                    flags: MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            // No sandbox o Mercado Pago exige dados de teste predefinidos.
+            if (MERCADO_PAGO_TEST_MODE) {
+
+                await interaction.deferReply({
+                    flags: MessageFlags.Ephemeral
+                });
+
+                try {
+
+                    let descricao = "RZ Store";
+
+                    if (referencia.startsWith("robux-")) {
+                        const quantidade = Number(
+                            referencia.replace("robux-", "")
+                        );
+
+                        descricao =
+                            `RZ Store - ${quantidade.toLocaleString("pt-BR")} Robux`;
+                    }
+
+                    if (referencia.startsWith("item-")) {
+                        const item = referencia.replace("item-", "");
+
+                        descricao =
+                            item === "korblox"
+                                ? "RZ Store - Korblox"
+                                : "RZ Store - Headless";
+                    }
+
+                    const dados = await criarCobrancaPix({
+                        valorCentavos,
+                        descricao,
+                        discordUserId: interaction.user.id,
+                        channelId: interaction.channel.id,
+                        payerEmail: "test_user_br@testuser.com"
+                    });
+
+                    await enviarPixNoTicket(
+                        interaction,
+                        dados,
+                        valorCentavos
+                    );
+
+                } catch (error) {
+
+                    console.error(
+                        "Erro ao gerar PIX de teste:",
+                        error
+                    );
+
+                    console.error(
+                        "Resposta Mercado Pago:",
+                        error?.cause || error?.response || error
+                    );
+
+                    const mensagemMercadoPago =
+                        error?.mercadoPago?.message ||
+                        error?.mercadoPago?.error ||
+                        error?.message ||
+                        "Erro desconhecido.";
+
+                    await interaction.editReply({
+                        content:
+                            "<:x_:1549124126575165533> Não foi possível gerar o PIX de teste.\n" +
+                            `Detalhe: \`${String(mensagemMercadoPago).slice(0, 500)}\``
+                    });
+                }
+
+                return;
+            }
+
+            // Produção: pede somente o e-mail do pagador.
+            const modalPix = new ModalBuilder()
+                .setCustomId(
+                    `modal_pix_${valorCentavos}_${referencia}`
+                )
+                .setTitle("Gerar pagamento PIX");
+
+            const emailInput = new TextInputBuilder()
+                .setCustomId("pix_email")
+                .setLabel("E-mail do pagador")
+                .setPlaceholder("exemplo@email.com")
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true)
+                .setMaxLength(100);
+
+            modalPix.addComponents(
+                new ActionRowBuilder()
+                    .addComponents(emailInput)
+            );
+
+            await interaction.showModal(modalPix);
+
+            return;
+        }
+
 
         // =========================================
         // CONFIRMAR COMPRA
@@ -840,15 +1600,26 @@ if (ticketExistente) {
                 `### <:ampulheta:1549129208557469786> Status\n` +
                 `> Aguardando pagamento.\n\n` +
 
-                `Em breve o pagamento via PIX será gerado neste canal.`
+                `Clique no botão **Gerar PIX** abaixo para criar sua cobrança.`
             )
             .setFooter({
                 text: "RZ Store"
             })
             .setTimestamp();
 
-        const botaoFecharTicket = new ActionRowBuilder()
+        const valorCentavos = Math.round(valor * 100);
+
+        const botoesTicket = new ActionRowBuilder()
             .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`gerar_pix_${valorCentavos}_robux-${quantidade}`)
+                    .setLabel("Gerar PIX")
+                    .setEmoji({
+                        id: "1548090281402966107",
+                        name: "pix"
+                    })
+                    .setStyle(ButtonStyle.Success),
+
                 new ButtonBuilder()
                     .setCustomId("fechar_ticket")
                     .setLabel("Fechar ticket")
@@ -862,7 +1633,7 @@ if (ticketExistente) {
         await ticket.send({
             content: `${interaction.user} <@&${process.env.STAFF_ROLE_ID}>`,
             embeds: [embedTicket],
-            components: [botaoFecharTicket]
+            components: [botoesTicket]
         });
 
         const embedCriado = new EmbedBuilder()
@@ -1045,15 +1816,26 @@ if (ticketExistente) {
                         `### <:ampulheta:1549129208557469786> Status\n` +
                         `> Aguardando pagamento.\n\n` +
 
-                        `Em breve o pagamento via PIX será gerado neste canal.`
+                        `Clique no botão **Gerar PIX** abaixo para criar sua cobrança.`
                     )
                     .setFooter({
                         text: "RZ Store"
                     })
                     .setTimestamp();
 
-                const botaoFecharTicketItem = new ActionRowBuilder()
+                const valorCentavosItem = Math.round(produto.valor * 100);
+
+                const botoesTicketItem = new ActionRowBuilder()
                     .addComponents(
+                        new ButtonBuilder()
+                            .setCustomId(`gerar_pix_${valorCentavosItem}_item-${opcao}`)
+                            .setLabel("Gerar PIX")
+                            .setEmoji({
+                                id: "1548090281402966107",
+                                name: "pix"
+                            })
+                            .setStyle(ButtonStyle.Success),
+
                         new ButtonBuilder()
                             .setCustomId("fechar_ticket")
                             .setLabel("Fechar ticket")
@@ -1067,7 +1849,7 @@ if (ticketExistente) {
                 await ticket.send({
                     content: `${interaction.user} <@&${process.env.STAFF_ROLE_ID}>`,
                     embeds: [embedTicketItem],
-                    components: [botaoFecharTicketItem]
+                    components: [botoesTicketItem]
                 });
 
                 const embedCriadoItem = new EmbedBuilder()
