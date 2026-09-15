@@ -48,8 +48,16 @@ const mercadoPagoClient = new MercadoPagoConfig({
 
 const mercadoPagoOrder = new Order(mercadoPagoClient);
 
+// Falha de configuração nunca deve colocar a loja em produção sem querer.
+// Só entra em produção quando MERCADO_PAGO_TEST_MODE=false estiver explícito.
 const MERCADO_PAGO_TEST_MODE =
-    process.env.MERCADO_PAGO_TEST_MODE === "true";
+    String(
+        process.env.MERCADO_PAGO_TEST_MODE ??
+        "true"
+    )
+        .trim()
+        .toLowerCase() !==
+    "false";
 
 const CARGOS_EM_TESTE =
     process.env.CARGOS_EM_TESTE === "true";
@@ -57,9 +65,12 @@ const CARGOS_EM_TESTE =
 // Banco de teste separado do banco real.
 // Assim, os testes do Mercado Pago não misturam os gastos reais.
 const DATABASE_FILE =
-    MERCADO_PAGO_TEST_MODE
-        ? "./rz-store-test.db"
-        : "./rz-store.db";
+    path.join(
+        __dirname,
+        MERCADO_PAGO_TEST_MODE
+            ? "rz-store-test.db"
+            : "rz-store.db"
+    );
 
 const db = new DatabaseSync(DATABASE_FILE);
 
@@ -451,6 +462,9 @@ db.exec(`
     CREATE INDEX IF NOT EXISTS idx_compras_discord_id
     ON compras(discord_id);
 
+    CREATE INDEX IF NOT EXISTS idx_compras_criado_em
+    ON compras(criado_em);
+
     CREATE TABLE IF NOT EXISTS estoque (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         quantidade INTEGER NOT NULL DEFAULT 0,
@@ -639,6 +653,11 @@ if (
         ADD COLUMN somente_boosters INTEGER NOT NULL DEFAULT 0
     `);
 }
+
+db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_compras_cupom_codigo
+    ON compras(cupom_codigo);
+`);
 
 console.log(
     `[BANCO] SQLite carregado: ${DATABASE_FILE}`
@@ -1492,7 +1511,7 @@ function obterRobuxPedidosEmAberto(
                     ) AS total
                 FROM pedidos_abertos
                 WHERE
-                    status = 'aberto'
+                    status IN ('aberto', 'atencao')
                     AND channel_id <> ?
             `).get(
                 excluirChannelId
@@ -1508,7 +1527,7 @@ function obterRobuxPedidosEmAberto(
                         0
                     ) AS total
                 FROM pedidos_abertos
-                WHERE status = 'aberto'
+                WHERE status IN ('aberto', 'atencao')
             `).get();
     }
 
@@ -1843,6 +1862,41 @@ function pedidoAbertoExpirou(pedido) {
     );
 }
 
+function marcarPedidoEmAtencao(
+    channelId,
+    orderId = null
+) {
+
+    if (!channelId) {
+        return false;
+    }
+
+    const resultado =
+        db.prepare(`
+            UPDATE pedidos_abertos
+            SET
+                status = 'atencao',
+                order_id =
+                    COALESCE(
+                        ?,
+                        order_id
+                    ),
+                encerrado_em =
+                    NULL
+            WHERE
+                channel_id = ?
+                AND status = 'aberto'
+        `).run(
+            orderId,
+            channelId
+        );
+
+    return Number(
+        resultado.changes
+    ) > 0;
+}
+
+
 function encerrarPedidoEmAberto(
     channelId,
     status = "cancelado",
@@ -1891,7 +1945,9 @@ async function reconciliarPedidosEmAberto(
 
         const pedidos =
             db.prepare(`
-                SELECT channel_id
+                SELECT
+                    channel_id,
+                    order_id
                 FROM pedidos_abertos
                 WHERE status = 'aberto'
             `).all();
@@ -1902,16 +1958,128 @@ async function reconciliarPedidosEmAberto(
         ) {
 
             if (
-                !canais.has(
+                canais.has(
                     pedido.channel_id
                 )
             ) {
-
-                encerrarPedidoEmAberto(
-                    pedido.channel_id,
-                    "cancelado"
-                );
+                continue;
             }
+
+            if (pedido.order_id) {
+
+                try {
+
+                    const order =
+                        await buscarOrderMercadoPago(
+                            pedido.order_id
+                        );
+
+                    if (
+                        orderMercadoPagoAprovada(
+                            order
+                        )
+                    ) {
+
+                        marcarPedidoEmAtencao(
+                            pedido.channel_id,
+                            pedido.order_id
+                        );
+
+                        console.error(
+                            `[ESTOQUE] Canal ${pedido.channel_id} sumiu, mas a order ${pedido.order_id} está paga. Reserva mantida em ATENÇÃO.`
+                        );
+
+                        continue;
+                    }
+
+                    const estados =
+                        [
+                            order?.status,
+                            order?.status_detail,
+                            order?.transactions
+                                ?.payments?.[0]
+                                ?.status,
+                            order?.transactions
+                                ?.payments?.[0]
+                                ?.status_detail
+                        ]
+                            .filter(Boolean)
+                            .map(
+                                valor =>
+                                    String(
+                                        valor
+                                    ).toLowerCase()
+                            );
+
+                    const encerrada =
+                        estados.some(
+                            estado =>
+                                [
+                                    "canceled",
+                                    "cancelled",
+                                    "expired",
+                                    "failed",
+                                    "rejected"
+                                ].includes(
+                                    estado
+                                )
+                        );
+
+                    if (!encerrada) {
+
+                        try {
+
+                            await cancelarOrderMercadoPago(
+                                pedido.order_id
+                            );
+
+                        } catch (cancelError) {
+
+                            if (
+                                !MERCADO_PAGO_TEST_MODE
+                            ) {
+
+                                marcarPedidoEmAtencao(
+                                    pedido.channel_id,
+                                    pedido.order_id
+                                );
+
+                                console.error(
+                                    `[ESTOQUE] Canal ${pedido.channel_id} sumiu e a cobrança ${pedido.order_id} não pôde ser cancelada. Reserva mantida em ATENÇÃO.`,
+                                    cancelError
+                                );
+
+                                continue;
+                            }
+                        }
+                    }
+
+                } catch (orderError) {
+
+                    if (
+                        !MERCADO_PAGO_TEST_MODE
+                    ) {
+
+                        marcarPedidoEmAtencao(
+                            pedido.channel_id,
+                            pedido.order_id
+                        );
+
+                        console.error(
+                            `[ESTOQUE] Não foi possível validar a order ${pedido.order_id} do canal ausente. Reserva mantida em ATENÇÃO.`,
+                            orderError
+                        );
+
+                        continue;
+                    }
+                }
+            }
+
+            encerrarPedidoEmAberto(
+                pedido.channel_id,
+                "cancelado",
+                pedido.order_id || null
+            );
         }
 
     } catch (error) {
@@ -3920,6 +4088,24 @@ function registrarCompraAprovada({
 
         if (compraExistente) {
 
+            if (ticketChannelId) {
+
+                db.prepare(`
+                    UPDATE pedidos_abertos
+                    SET
+                        status = 'pago',
+                        order_id = ?,
+                        encerrado_em =
+                            CURRENT_TIMESTAMP
+                    WHERE
+                        channel_id = ?
+                        AND status IN ('aberto', 'atencao')
+                `).run(
+                    orderId,
+                    ticketChannelId
+                );
+            }
+
             const cliente =
                 db.prepare(`
                     SELECT
@@ -4026,7 +4212,7 @@ function registrarCompraAprovada({
                         CURRENT_TIMESTAMP
                 WHERE
                     channel_id = ?
-                    AND status = 'aberto'
+                    AND status IN ('aberto', 'atencao')
             `).run(
                 orderId,
                 ticketChannelId
@@ -4761,6 +4947,165 @@ async function atualizarMensagemPrincipalPedidoPago(
 }
 
 
+async function ticketTemBotaoRoblox(
+    ticket
+) {
+
+    try {
+
+        const mensagens =
+            await ticket.messages.fetch({
+                limit:
+                    100
+            });
+
+        return mensagens.some(
+            mensagem =>
+                mensagem.author?.id ===
+                    client.user.id &&
+                mensagem.components.some(
+                    row =>
+                        row.components.some(
+                            component =>
+                                component.customId ===
+                                "enviar_nick_roblox"
+                        )
+                )
+        );
+
+    } catch (error) {
+
+        console.warn(
+            `[PAGAMENTO] Não consegui verificar o botão do Roblox no ticket ${ticket.id}:`,
+            error?.message ||
+            error
+        );
+
+        return false;
+    }
+}
+
+
+async function enviarConfirmacaoPagamentoRecuperada({
+    ticket,
+    donoTicket,
+    orderId
+}) {
+
+    if (
+        await ticketTemBotaoRoblox(
+            ticket
+        )
+    ) {
+        return false;
+    }
+
+    const compra =
+        db.prepare(`
+            SELECT
+                payment_id,
+                valor_centavos,
+                cupom_codigo,
+                quantidade_robux,
+                produto
+            FROM compras
+            WHERE order_id = ?
+        `).get(
+            orderId
+        );
+
+    if (!compra) {
+        return false;
+    }
+
+    const valorFormatado =
+        (
+            Number(
+                compra.valor_centavos ||
+                0
+            ) / 100
+        ).toLocaleString(
+            "pt-BR",
+            {
+                style:
+                    "currency",
+                currency:
+                    "BRL"
+            }
+        );
+
+    const embed =
+        new EmbedBuilder()
+            .setColor(
+                "#00db0f"
+            )
+            .setTitle(
+                "<:okk:1549125132906270851> Pagamento confirmado!"
+            )
+            .setDescription(
+                "O pagamento deste pedido já consta como **aprovado** no banco da RZ Store. O bot recuperou automaticamente o fluxo após uma interrupção.\n\n" +
+                `> **Order:** \`${orderId}\`\n` +
+                `> **Pagamento:** \`${compra.payment_id || "—"}\`\n` +
+                `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n` +
+                (
+                    compra.cupom_codigo
+                        ? `> <:cupom:1548097312046186559> **Cupom:** \`${compra.cupom_codigo}\`\n`
+                        : ""
+                ) +
+                "\nAgora envie seu **nome de usuário ou ID do Roblox** para realizarmos a entrega."
+            )
+            .setFooter({
+                text:
+                    "RZ Store • Recuperação automática"
+            })
+            .setTimestamp();
+
+    const botaoRoblox =
+        new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(
+                        "enviar_nick_roblox"
+                    )
+                    .setLabel(
+                        "Enviar nick do Roblox"
+                    )
+                    .setEmoji({
+                        id:
+                            "1548176792010104923",
+                        name:
+                            "roblox"
+                    })
+                    .setStyle(
+                        ButtonStyle.Success
+                    )
+            );
+
+    await ticket.send({
+        content:
+            donoTicket
+                ? `<@${donoTicket}>`
+                : undefined,
+        embeds: [
+            embed
+        ],
+        components: [
+            botaoRoblox
+        ],
+        allowedMentions: {
+            users:
+                donoTicket
+                    ? [
+                        donoTicket
+                    ]
+                    : []
+        }
+    });
+
+    return true;
+}
+
+
 async function sincronizarMensagensPedidosPagos(
     guild
 ) {
@@ -4772,21 +5117,66 @@ async function sincronizarMensagensPedidosPagos(
 
         const ticketsPagos =
             canais.filter(
-                channel =>
-                    channel &&
-                    channel.type ===
-                        ChannelType.GuildText &&
-                    channel.parentId ===
-                        process.env.CATEGORY_TICKETS_ID &&
-                    channel.topic?.includes(
-                        "mp-status:accredited"
-                    )
+                channel => {
+
+                    if (
+                        !channel ||
+                        channel.type !==
+                            ChannelType.GuildText ||
+                        channel.parentId !==
+                            process.env.CATEGORY_TICKETS_ID
+                    ) {
+                        return false;
+                    }
+
+                    const orderId =
+                        channel.topic
+                            ?.match(
+                                /mp-order:([^|]+)/
+                            )?.[1]
+                            ?.trim();
+
+                    if (!orderId) {
+                        return false;
+                    }
+
+                    const compra =
+                        db.prepare(`
+                            SELECT order_id
+                            FROM compras
+                            WHERE order_id = ?
+                        `).get(
+                            orderId
+                        );
+
+                    return (
+                        Boolean(
+                            compra
+                        ) ||
+                        channel.topic?.includes(
+                            "mp-status:accredited"
+                        )
+                    );
+                }
             );
 
         for (
             const ticket
             of ticketsPagos.values()
         ) {
+
+            const orderId =
+                ticket.topic
+                    ?.match(
+                        /mp-order:([^|]+)/
+                    )?.[1]
+                    ?.trim();
+
+            const donoTicket =
+                ticket.topic
+                    ?.match(
+                        /rzstore-user:(\d+)/
+                    )?.[1];
 
             limparTimerExpiracaoPedido(
                 ticket.id
@@ -4795,6 +5185,40 @@ async function sincronizarMensagensPedidosPagos(
             await atualizarMensagemPrincipalPedidoPago(
                 ticket
             );
+
+            if (orderId) {
+
+                await enviarConfirmacaoPagamentoRecuperada({
+                    ticket,
+                    donoTicket,
+                    orderId
+                });
+
+                if (
+                    !ticket.topic?.includes(
+                        "mp-status:accredited"
+                    )
+                ) {
+
+                    const topicoAtual =
+                        ticket.topic ||
+                        "";
+
+                    const novoTopico =
+                        /mp-status:[^|]+/.test(
+                            topicoAtual
+                        )
+                            ? topicoAtual.replace(
+                                /mp-status:[^|]+/,
+                                "mp-status:accredited"
+                            )
+                            : `${topicoAtual} | mp-status:accredited`;
+
+                    await ticket.setTopic(
+                        novoTopico
+                    );
+                }
+            }
         }
 
         if (
@@ -5013,6 +5437,139 @@ async function processarOrderAprovada(orderId) {
             );
         }
 
+        if (
+            !MERCADO_PAGO_TEST_MODE
+        ) {
+
+            const valorEsperado =
+                valorCentavosPedido /
+                100;
+
+            const valorRecebido =
+                Number(
+                    pagamento?.paid_amount ??
+                    pagamento?.amount ??
+                    order.total_paid_amount ??
+                    NaN
+                );
+
+            if (
+                !Number.isFinite(
+                    valorRecebido
+                ) ||
+                Math.abs(
+                    valorRecebido -
+                    valorEsperado
+                ) >
+                0.009
+            ) {
+
+                const embedDivergencia =
+                    new EmbedBuilder()
+                        .setColor(
+                            "#00db0f"
+                        )
+                        .setTitle(
+                            "<:danger:1549129849904566392> Pagamento com valor divergente"
+                        )
+                        .setDescription(
+                            "O Mercado Pago informou um pagamento aprovado, mas o valor recebido não corresponde ao valor deste ticket. O pedido **não foi registrado automaticamente**.\n\n" +
+                            `> **Esperado:** ${valorEsperado.toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}\n` +
+                            `> **Recebido:** ${Number.isFinite(valorRecebido) ? valorRecebido.toLocaleString("pt-BR", { style: "currency", currency: "BRL" }) : "Não identificado"}\n` +
+                            `> **Order:** \`${orderId}\`\n\n` +
+                            `<@&${process.env.STAFF_ROLE_ID}> verifique manualmente antes de realizar a entrega.`
+                        )
+                        .setTimestamp();
+
+                marcarPedidoEmAtencao(
+                    ticket.id,
+                    orderId
+                );
+
+                limparTimerExpiracaoPedido(
+                    ticket.id
+                );
+
+                await atualizarPainelEstoque(
+                    guild
+                );
+
+                await ticket.send({
+                    content:
+                        `<@&${process.env.STAFF_ROLE_ID}>`,
+                    embeds: [
+                        embedDivergencia
+                    ],
+                    allowedMentions: {
+                        roles: [
+                            process.env.STAFF_ROLE_ID
+                        ]
+                    }
+                });
+
+                console.error(
+                    `[PAGAMENTO] Divergência de valor na order ${orderId}: esperado=${valorEsperado}, recebido=${valorRecebido}.`
+                );
+
+                return;
+            }
+
+            const referenciaEsperada =
+                `rzstore-${donoTicket}-${ticket.id}`;
+
+            if (
+                order.external_reference &&
+                order.external_reference !==
+                    referenciaEsperada
+            ) {
+
+                marcarPedidoEmAtencao(
+                    ticket.id,
+                    orderId
+                );
+
+                limparTimerExpiracaoPedido(
+                    ticket.id
+                );
+
+                await atualizarPainelEstoque(
+                    guild
+                );
+
+                await ticket.send({
+                    content:
+                        `<@&${process.env.STAFF_ROLE_ID}>`,
+                    embeds: [
+                        new EmbedBuilder()
+                            .setColor(
+                                "#00db0f"
+                            )
+                            .setTitle(
+                                "<:danger:1549129849904566392> Order não corresponde ao ticket"
+                            )
+                            .setDescription(
+                                "A referência da Order do Mercado Pago não corresponde ao cliente/canal deste ticket. O processamento automático foi interrompido por segurança.\n\n" +
+                                `> **Order:** \`${orderId}\`\n` +
+                                `> **Referência recebida:** \`${order.external_reference}\`\n` +
+                                `> **Referência esperada:** \`${referenciaEsperada}\``
+                            )
+                            .setTimestamp()
+                    ],
+                    allowedMentions: {
+                        roles: [
+                            process.env.STAFF_ROLE_ID
+                        ]
+                    }
+                });
+
+                console.error(
+                    `[PAGAMENTO] external_reference divergente na order ${orderId}.`
+                );
+
+                return;
+            }
+        }
+
         const registro =
             registrarCompraAprovada({
                 orderId,
@@ -5056,6 +5613,19 @@ async function processarOrderAprovada(orderId) {
                 formatarRobux(
                     quantidadeRobux
                 );
+
+            marcarPedidoEmAtencao(
+                ticket.id,
+                orderId
+            );
+
+            limparTimerExpiracaoPedido(
+                ticket.id
+            );
+
+            await atualizarPainelEstoque(
+                guild
+            );
 
             const embedSemEstoque =
                 new EmbedBuilder()
@@ -5105,15 +5675,14 @@ async function processarOrderAprovada(orderId) {
             return;
         }
 
-        // A order já foi salva antes: não aplica cargo,
-        // não envia evolução e não manda confirmação novamente.
-        if (!registro.novaCompra) {
+        const compraJaExistia =
+            !registro.novaCompra;
 
-            console.log(
-                `[WEBHOOK] Order ${orderId} já estava registrada no banco. Ignorando processamento duplicado.`
+        if (compraJaExistia) {
+
+            console.warn(
+                `[WEBHOOK] Order ${orderId} já estava no banco, mas o ticket ainda não estava totalmente sincronizado. Recuperando o fluxo.`
             );
-
-            return;
         }
 
         await notificarEstoqueBaixo(
@@ -5247,14 +5816,32 @@ async function processarOrderAprovada(orderId) {
                     .setStyle(ButtonStyle.Success)
             );
 
-        await ticket.send({
-            content:
-                donoTicket
-                    ? `<@${donoTicket}> agora envie seu **nome de usuário ou ID do Roblox** para realizarmos a entrega.`
-                    : undefined,
-            embeds: [embedPagamento],
-            components: [botaoRoblox]
-        });
+        const jaTemBotaoRoblox =
+            await ticketTemBotaoRoblox(
+                ticket
+            );
+
+        if (!jaTemBotaoRoblox) {
+
+            await ticket.send({
+                content:
+                    donoTicket
+                        ? `<@${donoTicket}> agora envie seu **nome de usuário ou ID do Roblox** para realizarmos a entrega.`
+                        : undefined,
+                embeds: [
+                    embedPagamento
+                ],
+                components: [
+                    botaoRoblox
+                ]
+            });
+
+        } else {
+
+            console.log(
+                `[WEBHOOK] O ticket ${ticket.id} já possui o botão de envio do Roblox. Mensagem duplicada evitada.`
+            );
+        }
 
         const topicoAtual =
             ticket.topic || "";
@@ -5412,6 +5999,273 @@ app.post(
 );
 
 
+async function prepararFechamentoSeguroTicket(
+    channel
+) {
+
+    const orderId =
+        channel.topic
+            ?.match(
+                /mp-order:([^|]+)/
+            )?.[1]
+            ?.trim();
+
+    if (!orderId) {
+
+        return {
+            podeFechar:
+                true,
+            cancelouPix:
+                false,
+            orderId:
+                null
+        };
+    }
+
+    const compra =
+        db.prepare(`
+            SELECT
+                entregue
+            FROM compras
+            WHERE order_id = ?
+        `).get(
+            orderId
+        );
+
+    if (compra) {
+
+        if (
+            Number(
+                compra.entregue
+            ) !== 1
+        ) {
+
+            return {
+                podeFechar:
+                    false,
+                cancelouPix:
+                    false,
+                orderId,
+                motivo:
+                    "Este pedido já está **pago** e ainda não foi marcado como entregue. Marque a entrega antes de fechar o ticket."
+            };
+        }
+
+        return {
+            podeFechar:
+                true,
+            cancelouPix:
+                false,
+            orderId
+        };
+    }
+
+    let order;
+
+    try {
+
+        order =
+            await buscarOrderMercadoPago(
+                orderId
+            );
+
+    } catch (error) {
+
+        return {
+            podeFechar:
+                false,
+            cancelouPix:
+                false,
+            orderId,
+            motivo:
+                "Não consegui confirmar o status da cobrança no Mercado Pago. Por segurança, o ticket não foi fechado."
+        };
+    }
+
+    if (
+        orderMercadoPagoAprovada(
+            order
+        )
+    ) {
+
+        await processarOrderAprovada(
+            orderId
+        );
+
+        return {
+            podeFechar:
+                false,
+            cancelouPix:
+                false,
+            orderId,
+            motivo:
+                "O Mercado Pago informou que este pedido **já foi pago**. O pagamento foi processado e o ticket foi mantido aberto para a entrega."
+        };
+    }
+
+    const estados =
+        [
+            order?.status,
+            order?.status_detail,
+            order?.transactions
+                ?.payments?.[0]
+                ?.status,
+            order?.transactions
+                ?.payments?.[0]
+                ?.status_detail
+        ]
+            .filter(Boolean)
+            .map(
+                valor =>
+                    String(
+                        valor
+                    ).toLowerCase()
+            );
+
+    const encerrada =
+        estados.some(
+            estado =>
+                [
+                    "canceled",
+                    "cancelled",
+                    "expired",
+                    "failed",
+                    "rejected"
+                ].includes(
+                    estado
+                )
+        );
+
+    if (encerrada) {
+
+        return {
+            podeFechar:
+                true,
+            cancelouPix:
+                false,
+            orderId
+        };
+    }
+
+    try {
+
+        await cancelarOrderMercadoPago(
+            orderId
+        );
+
+        return {
+            podeFechar:
+                true,
+            cancelouPix:
+                true,
+            orderId
+        };
+
+    } catch (error) {
+
+        // Reconsulta para cobrir a corrida em que o cliente paga
+        // exatamente enquanto a equipe tenta fechar o ticket.
+        try {
+
+            const depois =
+                await buscarOrderMercadoPago(
+                    orderId
+                );
+
+            if (
+                orderMercadoPagoAprovada(
+                    depois
+                )
+            ) {
+
+                await processarOrderAprovada(
+                    orderId
+                );
+
+                return {
+                    podeFechar:
+                        false,
+                    cancelouPix:
+                        false,
+                    orderId,
+                    motivo:
+                        "O pagamento foi aprovado enquanto o ticket estava sendo fechado. O ticket foi mantido aberto para a entrega."
+                };
+            }
+
+            const estadosDepois =
+                [
+                    depois?.status,
+                    depois?.status_detail,
+                    depois?.transactions
+                        ?.payments?.[0]
+                        ?.status,
+                    depois?.transactions
+                        ?.payments?.[0]
+                        ?.status_detail
+                ]
+                    .filter(Boolean)
+                    .map(
+                        valor =>
+                            String(
+                                valor
+                            ).toLowerCase()
+                    );
+
+            if (
+                estadosDepois.some(
+                    estado =>
+                        [
+                            "canceled",
+                            "cancelled",
+                            "expired",
+                            "failed",
+                            "rejected"
+                        ].includes(
+                            estado
+                        )
+                )
+            ) {
+
+                return {
+                    podeFechar:
+                        true,
+                    cancelouPix:
+                        false,
+                    orderId
+                };
+            }
+
+        } catch {}
+
+        if (MERCADO_PAGO_TEST_MODE) {
+
+            console.warn(
+                `[TICKET] Sandbox: não foi possível confirmar o cancelamento da order ${orderId}. Permitindo fechar o ticket de teste.`
+            );
+
+            return {
+                podeFechar:
+                    true,
+                cancelouPix:
+                    false,
+                orderId
+            };
+        }
+
+        return {
+            podeFechar:
+                false,
+            cancelouPix:
+                false,
+            orderId,
+            motivo:
+                "Não foi possível cancelar a cobrança PIX com segurança. O ticket continuará aberto para evitar um pagamento sem pedido."
+        };
+    }
+}
+
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds
@@ -5429,6 +6283,45 @@ const ordersEmProcessamento = new Set();
 client.once("clientReady", async () => {
 
     console.log(`Bot online como ${client.user.tag}`);
+
+    const configuracoesEssenciais = [
+        "GUILD_ID",
+        "CATEGORY_TICKETS_ID",
+        "STAFF_ROLE_ID",
+        "MERCADO_PAGO_ACCESS_TOKEN",
+        "MERCADO_PAGO_WEBHOOK_SECRET"
+    ];
+
+    const configuracoesAusentes =
+        configuracoesEssenciais.filter(
+            chave =>
+                !process.env[chave]
+                    ?.trim()
+        );
+
+    if (
+        configuracoesAusentes.length >
+        0
+    ) {
+
+        console.warn(
+            `[CONFIG] Atenção: faltando ${configuracoesAusentes.join(", ")}.`
+        );
+    }
+
+    if (
+        !MERCADO_PAGO_TEST_MODE
+    ) {
+
+        console.log(
+            "[CONFIG] Modo PRODUÇÃO ativo. O bot usará rz-store.db e valores reais no Mercado Pago."
+        );
+    } else {
+
+        console.log(
+            "[CONFIG] Modo TESTE ativo. Nenhuma cobrança real será criada pelo fluxo configurado."
+        );
+    }
     console.log(
         `[EXPIRAÇÃO] Prazo configurado: ${obterPrazoExpiracaoPedidoMinutos()} minuto(s).`
     );
@@ -5985,12 +6878,242 @@ async function enviarPixNoTicket(interaction, dados, valorCentavos) {
 
 client.on(Events.ChannelDelete, async channel => {
 
+    // Fechar pelo botão do bot é sempre o fluxo preferido.
+    // Se alguém apagar o canal diretamente no Discord, tentamos
+    // impedir que uma cobrança pendente continue pagável sem ticket.
     try {
+
+        const orderId =
+            channel.topic
+                ?.match(
+                    /mp-order:([^|]+)/
+                )?.[1]
+                ?.trim() ||
+            null;
+
+        const donoTicket =
+            channel.topic
+                ?.match(
+                    /rzstore-user:(\d+)/
+                )?.[1] ||
+            null;
+
+        const compra =
+            orderId
+                ? db.prepare(`
+                    SELECT
+                        order_id,
+                        entregue
+                    FROM compras
+                    WHERE order_id = ?
+                `).get(
+                    orderId
+                )
+                : null;
+
+        if (
+            compra &&
+            Number(
+                compra.entregue
+            ) !== 1 &&
+            channel.guild
+        ) {
+
+            await enviarLogStaff({
+                guild:
+                    channel.guild,
+                staff:
+                    client.user,
+                titulo:
+                    "ATENÇÃO: ticket pago apagado manualmente",
+                emoji:
+                    "<:danger:1549129849904566392>",
+                descricao:
+                    `> <:cliente:1548196941102317568> **Cliente:** ${donoTicket ? `<@${donoTicket}>` : "Não identificado"}\n` +
+                    `> **Order:** \`${orderId}\`\n` +
+                    `> **Canal apagado:** \`${channel.name}\` (\`${channel.id}\`)\n\n` +
+                    "O pagamento já estava registrado, mas a entrega ainda não estava marcada. Verifique este pedido manualmente."
+            });
+        }
+
+        if (
+            orderId &&
+            !compra
+        ) {
+
+            try {
+
+                const order =
+                    await buscarOrderMercadoPago(
+                        orderId
+                    );
+
+                if (
+                    orderMercadoPagoAprovada(
+                        order
+                    )
+                ) {
+
+                    marcarPedidoEmAtencao(
+                        channel.id,
+                        orderId
+                    );
+
+                    limparTimerExpiracaoPedido(
+                        channel.id
+                    );
+
+                    if (channel.guild) {
+
+                        await atualizarPainelEstoque(
+                            channel.guild
+                        );
+
+                        await enviarLogStaff({
+                            guild:
+                                channel.guild,
+                            staff:
+                                client.user,
+                            titulo:
+                                "ATENÇÃO: pagamento aprovado em canal apagado",
+                            emoji:
+                                "<:danger:1549129849904566392>",
+                            descricao:
+                                `> <:cliente:1548196941102317568> **Cliente:** ${donoTicket ? `<@${donoTicket}>` : "Não identificado"}\n` +
+                                `> **Order:** \`${orderId}\`\n` +
+                                `> **Canal apagado:** \`${channel.name}\` (\`${channel.id}\`)\n\n` +
+                                "A reserva de estoque foi mantida em **ATENÇÃO** para impedir venda duplicada. Este caso precisa de revisão manual."
+                        });
+                    }
+
+                    return;
+                }
+
+                const estados =
+                    [
+                        order?.status,
+                        order?.status_detail,
+                        order?.transactions
+                            ?.payments?.[0]
+                            ?.status,
+                        order?.transactions
+                            ?.payments?.[0]
+                            ?.status_detail
+                    ]
+                        .filter(Boolean)
+                        .map(
+                            valor =>
+                                String(
+                                    valor
+                                ).toLowerCase()
+                        );
+
+                const encerrada =
+                    estados.some(
+                        estado =>
+                            [
+                                "canceled",
+                                "cancelled",
+                                "expired",
+                                "failed",
+                                "rejected"
+                            ].includes(
+                                estado
+                            )
+                    );
+
+                if (!encerrada) {
+
+                    try {
+
+                        await cancelarOrderMercadoPago(
+                            orderId
+                        );
+
+                    } catch (cancelError) {
+
+                        if (
+                            !MERCADO_PAGO_TEST_MODE
+                        ) {
+
+                            marcarPedidoEmAtencao(
+                                channel.id,
+                                orderId
+                            );
+
+                            limparTimerExpiracaoPedido(
+                                channel.id
+                            );
+
+                            if (channel.guild) {
+
+                                await atualizarPainelEstoque(
+                                    channel.guild
+                                );
+
+                                await enviarLogStaff({
+                                    guild:
+                                        channel.guild,
+                                    staff:
+                                        client.user,
+                                    titulo:
+                                        "ATENÇÃO: PIX não cancelado após apagar ticket",
+                                    emoji:
+                                        "<:danger:1549129849904566392>",
+                                    descricao:
+                                        `> **Order:** \`${orderId}\`\n` +
+                                        `> **Canal apagado:** \`${channel.name}\` (\`${channel.id}\`)\n\n` +
+                                        "A cobrança não pôde ser cancelada com segurança. A reserva foi mantida em **ATENÇÃO**."
+                                });
+                            }
+
+                            console.error(
+                                `[TICKET] Canal ${channel.id} apagado e order ${orderId} não cancelada.`,
+                                cancelError
+                            );
+
+                            return;
+                        }
+                    }
+                }
+
+            } catch (orderError) {
+
+                if (
+                    !MERCADO_PAGO_TEST_MODE
+                ) {
+
+                    marcarPedidoEmAtencao(
+                        channel.id,
+                        orderId
+                    );
+
+                    limparTimerExpiracaoPedido(
+                        channel.id
+                    );
+
+                    if (channel.guild) {
+
+                        await atualizarPainelEstoque(
+                            channel.guild
+                        );
+                    }
+
+                    console.error(
+                        `[TICKET] Não foi possível validar a order ${orderId} após exclusão do canal. Reserva mantida em ATENÇÃO.`,
+                        orderError
+                    );
+
+                    return;
+                }
+            }
+        }
 
         const pedidoFoiEncerrado =
             encerrarPedidoEmAberto(
                 channel.id,
-                "cancelado"
+                "cancelado",
+                orderId
             );
 
         limparTimerExpiracaoPedido(
@@ -6010,7 +7133,7 @@ client.on(Events.ChannelDelete, async channel => {
     } catch (error) {
 
         console.error(
-            "[ESTOQUE] Erro ao liberar pedido após exclusão do canal:",
+            "[ESTOQUE] Erro ao tratar exclusão direta de canal:",
             error
         );
     }
@@ -7271,6 +8394,14 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
+        const caminhoBannerCompra =
+            path.join(
+                __dirname,
+                "assets",
+                "paineis",
+                "comprar-banner.png"
+            );
+
         const embed = new EmbedBuilder()
             .setColor("#00db0f")
             .setTitle(
@@ -7305,7 +8436,7 @@ client.on(Events.InteractionCreate, async interaction => {
                 "> <:sup:1548200025442750505> Nossa equipe estará disponível no seu ticket para ajudar."
             )
             .setImage(
-                "https://media.discordapp.net/attachments/1548159183071879228/1548159323501363331/banner.png?ex=6aa8057a&is=6aa6b3fa&hm=6a052829674664f1687c06df6aaac6566c3492f8affed0d0437c965411e89e8c&=&format=webp&quality=lossless&width=2048&height=688"
+                "attachment://comprar-banner.png"
             )
             .setFooter({
                 text: "RZ Store"
@@ -7525,7 +8656,15 @@ client.on(Events.InteractionCreate, async interaction => {
 
         await interaction.channel.send({
             embeds: [embed],
-            components: [row]
+            components: [row],
+            files: [
+                {
+                    attachment:
+                        caminhoBannerCompra,
+                    name:
+                        "comprar-banner.png"
+                }
+            ]
         });
 
         return;
@@ -7558,6 +8697,14 @@ client.on(Events.InteractionCreate, async interaction => {
 
         
 
+        const caminhoBannerKorblox =
+            path.join(
+                __dirname,
+                "assets",
+                "paineis",
+                "korblox-headless.png"
+            );
+
         const embedKorblox = new EmbedBuilder()
             .setColor("#00db0f")
             .setTitle("<:coroa:1548189671501078588> Korblox & Headless — RZ Store")
@@ -7580,7 +8727,9 @@ client.on(Events.InteractionCreate, async interaction => {
                 "<:interrogacoes:1548096277856649296> **— PRECISOU DE AJUDA?**\n" +
                 "> <:sup:1548200025442750505> Nossa equipe estará disponível no seu ticket para ajudar."
             )
-            .setImage("https://cdn.discordapp.com/attachments/1548159183071879228/1548159369059762218/korblox_headless.png?ex=6aa95704&is=6aa80584&hm=2396d2211826f3393801d7e6644acc954fa14b8c0aa5e1cc964b9803a82b2313&")
+            .setImage(
+                "attachment://korblox-headless.png"
+            )
             .setFooter({
                 text: "RZ Store"
             });
@@ -7618,8 +8767,16 @@ client.on(Events.InteractionCreate, async interaction => {
         });
 
         await interaction.channel.send({
-        embeds: [embedKorblox],
-        components: [rowKorblox]
+            embeds: [embedKorblox],
+            components: [rowKorblox],
+            files: [
+                {
+                    attachment:
+                        caminhoBannerKorblox,
+                    name:
+                        "korblox-headless.png"
+                }
+            ]
         });
 
         return;
@@ -9098,10 +10255,27 @@ client.on(Events.InteractionCreate, async interaction => {
                         WHERE order_id = ?
                     `).get(orderId);
 
-                const membroCliente =
-                    await interaction.guild.members.fetch(
-                        donoTicket
+                let usuarioCliente =
+                    null;
+
+                try {
+
+                    usuarioCliente =
+                        await client.users.fetch(
+                            donoTicket
+                        );
+
+                } catch (userError) {
+
+                    console.warn(
+                        `[ENTREGA] Não consegui buscar o usuário ${donoTicket}, mas a entrega continuará:`,
+                        userError?.message ||
+                        userError
                     );
+                }
+
+                const mencaoCliente =
+                    `<@${donoTicket}>`;
 
                 // Desativa o botão original de entrega.
                 try {
@@ -9209,7 +10383,7 @@ client.on(Events.InteractionCreate, async interaction => {
                             "<a:greenverification:1548192162653536336> Pedido entregue!"
                         )
                         .setDescription(
-                            `${membroCliente}, seu pedido foi marcado como **entregue** pela equipe da RZ Store.\n\n` +
+                            `${mencaoCliente}, seu pedido foi marcado como **entregue** pela equipe da RZ Store.\n\n` +
                             `> <:greenrbx:1548088739677470881> **Quantidade:** ${quantidadeFormatada} Robux\n` +
                             `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n` +
                             `> <:sup:1548200025442750505> **Entregue por:** ${interaction.user}\n\n` +
@@ -9291,7 +10465,7 @@ client.on(Events.InteractionCreate, async interaction => {
                                         "<a:greenverification:1548192162653536336> Compra entregue"
                                     )
                                     .setDescription(
-                                        `> **Cliente:** ${membroCliente}\n` +
+                                        `> **Cliente:** ${mencaoCliente}\n` +
                                         `> **Discord ID:** \`${donoTicket}\`\n` +
                                         `> <:greenrbx:1548088739677470881> **Produto:** ${produtoTexto}\n` +
                                         `> <:greenrbx:1548088739677470881> **Quantidade:** ${quantidadeFormatada} Robux\n` +
@@ -9306,14 +10480,18 @@ client.on(Events.InteractionCreate, async interaction => {
                                         `> **Pagamento:** \`${compra?.payment_id || "—"}\`\n` +
                                         `> **Ticket:** ${interaction.channel}`
                                     )
-                                    .setThumbnail(
-                                        membroCliente.user.displayAvatarURL()
-                                    )
                                     .setFooter({
                                         text:
                                             "RZ Store • Log de compras"
                                     })
                                     .setTimestamp();
+
+                            if (usuarioCliente) {
+
+                                embedLogCompra.setThumbnail(
+                                    usuarioCliente.displayAvatarURL()
+                                );
+                            }
 
                             await canalLogs.send({
                                 embeds: [
@@ -9380,7 +10558,13 @@ client.on(Events.InteractionCreate, async interaction => {
                             })
                             .setTimestamp();
 
-                    await membroCliente.send({
+                    if (!usuarioCliente) {
+                        throw new Error(
+                            "Usuário do Discord não pôde ser carregado."
+                        );
+                    }
+
+                    await usuarioCliente.send({
                         embeds: [
                             embedPrivado
                         ]
@@ -10667,6 +11851,26 @@ if (ticketExistente) {
                     )?.[1]
                     ?.trim();
 
+            await interaction.deferUpdate();
+
+            const fechamentoSeguro =
+                await prepararFechamentoSeguroTicket(
+                    interaction.channel
+                );
+
+            if (
+                !fechamentoSeguro.podeFechar
+            ) {
+
+                await interaction.editReply({
+                    content:
+                        `<:danger:1549129849904566392> ${fechamentoSeguro.motivo}`,
+                    components: []
+                });
+
+                return;
+            }
+
             const pedidoFoiEncerrado =
                 encerrarPedidoEmAberto(
                     interaction.channel.id,
@@ -10699,10 +11903,11 @@ if (ticketExistente) {
                     `> <:cliente:1548196941102317568> **Cliente:** ${donoTicket ? `<@${donoTicket}>` : "Não identificado"}\n` +
                     `> **Ticket:** \`${interaction.channel.name}\` (\`${interaction.channel.id}\`)\n` +
                     `> **Order:** ${orderId ? `\`${orderId}\`` : "Nenhuma"}\n` +
+                    `> <:pix:1548090281402966107> **PIX pendente cancelado:** ${fechamentoSeguro.cancelouPix ? "Sim" : "Não / não se aplica"}\n` +
                     `> <:ampulheta:1549129208557469786> **Pedido em aberto cancelado:** ${pedidoFoiEncerrado ? "Sim" : "Não"}`
             });
 
-            await interaction.update({
+            await interaction.editReply({
                 content:
                     "<:cadeado:1549128145381367949> Ticket fechado. Este canal será apagado em **3 segundos**.",
                 components: []

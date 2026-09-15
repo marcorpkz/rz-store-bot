@@ -1,0 +1,105 @@
+RZ STORE - REVISÃO GERAL
+
+Revisado sobre a build com:
+- Mercado Pago Orders / PIX / webhook assinado
+- tickets privados
+- estoque + pedidos em aberto + limite de 50%
+- expiração automática + DM + logs
+- cupons avançados
+- fidelidade/cargos
+- envio de nick Roblox
+- entrega + DM + avaliação
+- painéis automáticos de estoque, vendas e cupons
+- modo manutenção
+- logs de staff
+- backup automático SQLite
+
+CORREÇÕES / ENDURECIMENTOS DESTA REVISÃO
+
+1. MODO TESTE FAIL-SAFE
+   Se MERCADO_PAGO_TEST_MODE estiver ausente, o bot permanece em TESTE.
+   Produção só ativa quando MERCADO_PAGO_TEST_MODE=false estiver explícito.
+
+2. CAMINHO DO SQLITE
+   rz-store.db / rz-store-test.db agora usam __dirname.
+   Isso evita criar outro banco por acidente caso a hospedagem use outro working directory.
+
+3. BANNERS LOCAIS
+   /setupcomprar e /korblox não usam mais URLs temporárias do CDN do Discord.
+   As imagens ficam em assets/paineis/.
+
+4. WEBHOOK MAIS SEGURO EM PRODUÇÃO
+   Antes de registrar a compra o bot valida:
+   - valor recebido x valor do ticket;
+   - external_reference x cliente/canal esperado.
+   Divergências entram em estado ATENÇÃO e mantêm estoque reservado.
+
+5. RECUPERAÇÃO DE PROCESSAMENTO PARCIAL
+   Se a compra entrou no SQLite mas o bot caiu antes de terminar o Discord,
+   o startup/webhook recupera:
+   - status visual do ticket;
+   - timer;
+   - tópico accredited;
+   - botão para enviar nick do Roblox.
+   Mensagem duplicada é evitada.
+
+6. FECHAMENTO DE TICKET SEGURO
+   - pedido pago e ainda não entregue não pode ser fechado;
+   - PIX pendente é cancelado antes de apagar o ticket;
+   - se o cliente pagar durante o fechamento, o ticket permanece aberto;
+   - no sandbox o fechamento continua prático mesmo se o endpoint de cancelamento de teste falhar.
+
+7. EXCLUSÃO DIRETA DE CANAL ENDURECIDA
+   Se alguém apagar o ticket manualmente pelo Discord:
+   - cobrança pendente é cancelada quando possível;
+   - se existir pagamento/estado incerto em produção, a reserva vira ATENÇÃO em vez de liberar estoque;
+   - staff recebe alerta nos logs quando aplicável.
+   Ainda é recomendado fechar tickets pelo botão do bot.
+
+8. ENTREGA MAIS ROBUSTA
+   Marcar como entregue não depende mais de o cliente ainda estar como membro do servidor.
+   Falha ao carregar usuário/DM não desfaz a entrega.
+
+9. ESTOQUE EM ATENÇÃO
+   Casos excepcionais (valor divergente, pagamento aprovado sem estoque, cobrança incerta
+   após canal apagado) permanecem reservados e não entram no loop de expiração.
+   Isso prioriza não vender o mesmo Robux duas vezes.
+
+10. ÍNDICES SQL
+    Índices adicionais para consultas por data e cupom ajudam o painel de vendas conforme o banco cresce.
+
+11. CONFIGURAÇÃO
+    O terminal avisa nomes de variáveis essenciais ausentes sem imprimir tokens/segredos.
+
+12. BACKUP
+    Sistema de backup e integrity_check preservado e retestado.
+
+PONTOS QUE NÃO BLOQUEIAM O LANÇAMENTO, MAS VALEM PARA O FUTURO
+
+A. LIMITE GLOBAL DE CUPOM
+   O limite total de usos é consumido quando o pagamento aprova, não reservado ao abrir o ticket.
+   Em uma corrida muito rara, dois clientes podem usar a última vaga do mesmo cupom quase ao mesmo tempo.
+   Para limite estritamente rígido, implementar reserva de cupom por ticket.
+
+B. BACKUP FORA DA MÁQUINA
+   A pasta backups/ protege contra bug/corrupção local, mas não contra perda completa do servidor/disco.
+   Em produção, o ideal é também copiar backups para armazenamento externo.
+
+C. REFUNDS
+   Não existe ainda um comando de estorno/reversão no banco.
+   Se um pagamento real for reembolsado manualmente no Mercado Pago, as estatísticas/fidelidade
+   não são revertidas automaticamente.
+
+D. ARQUITETURA
+   O index.js está grande. Funciona, mas no futuro vale separar em módulos (pagamentos, estoque,
+   cupons, tickets, banco, painéis) antes de continuar adicionando muitas features.
+
+ANTES DA PRODUÇÃO
+
+- MERCADO_PAGO_TEST_MODE=false
+- credenciais reais do Mercado Pago
+- webhook fixo HTTPS
+- armazenamento persistente para rz-store.db e backups/
+- regenerar qualquer segredo que tenha sido exposto durante testes
+- manter .env, *.db e backups/ fora do GitHub
+- fazer uma compra real pequena de ponta a ponta antes de divulgar a loja
