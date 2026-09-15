@@ -2226,6 +2226,440 @@ function formatarRobux(
 }
 
 
+function formatarMoedaCentavos(
+    centavos
+) {
+
+    return (
+        Number(
+            centavos || 0
+        ) / 100
+    ).toLocaleString(
+        "pt-BR",
+        {
+            style:
+                "currency",
+            currency:
+                "BRL"
+        }
+    );
+}
+
+
+function obterResumoVendas(
+    whereSql = "",
+    parametros = []
+) {
+
+    return db.prepare(`
+        SELECT
+            COUNT(*) AS pedidos,
+            COALESCE(
+                SUM(valor_centavos),
+                0
+            ) AS faturamento_centavos,
+            COALESCE(
+                SUM(quantidade_robux),
+                0
+            ) AS robux_vendidos,
+            COUNT(
+                DISTINCT discord_id
+            ) AS clientes_unicos,
+            COALESCE(
+                SUM(desconto_centavos),
+                0
+            ) AS descontos_centavos,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN entregue = 1
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            ) AS entregues
+        FROM compras
+        ${whereSql}
+    `).get(
+        ...parametros
+    );
+}
+
+
+function montarLinhaResumoVendas(
+    titulo,
+    resumo
+) {
+
+    const pedidos =
+        Number(
+            resumo?.pedidos ||
+            0
+        );
+
+    const faturamento =
+        formatarMoedaCentavos(
+            resumo?.faturamento_centavos
+        );
+
+    const robux =
+        formatarRobux(
+            resumo?.robux_vendidos
+        );
+
+    return (
+        `### ${titulo}\n` +
+        `> <:pix:1548090281402966107> **Faturamento:** ${faturamento}\n` +
+        `> <:greenrbx:1548088739677470881> **Robux vendidos:** ${robux} Robux\n` +
+        `> <:greencart:1548089836647485591> **Pedidos:** ${pedidos}`
+    );
+}
+
+
+async function atualizarPainelVendas(
+    guild
+) {
+
+    const canalVendasId =
+        process.env.CANAL_VENDAS_ID;
+
+    if (!canalVendasId) {
+
+        return {
+            atualizado:
+                false,
+            motivo:
+                "CANAL_VENDAS_ID não configurado."
+        };
+    }
+
+    try {
+
+        const canal =
+            await guild.channels.fetch(
+                canalVendasId
+            );
+
+        if (
+            !canal ||
+            !canal.isTextBased()
+        ) {
+            throw new Error(
+                "CANAL_VENDAS_ID não aponta para um canal de texto válido."
+            );
+        }
+
+        // O banco usa UTC. O ajuste -3/+3 deixa "Hoje"
+        // alinhado ao horário de Brasília.
+        const hoje =
+            obterResumoVendas(
+                "WHERE criado_em >= datetime('now', '-3 hours', 'start of day', '+3 hours')"
+            );
+
+        const seteDias =
+            obterResumoVendas(
+                "WHERE criado_em >= datetime('now', '-7 days')"
+            );
+
+        const trintaDias =
+            obterResumoVendas(
+                "WHERE criado_em >= datetime('now', '-30 days')"
+            );
+
+        const total =
+            obterResumoVendas();
+
+        const pedidosTotal =
+            Number(
+                total?.pedidos ||
+                0
+            );
+
+        const entreguesTotal =
+            Number(
+                total?.entregues ||
+                0
+            );
+
+        const aguardandoEntrega =
+            Math.max(
+                0,
+                pedidosTotal -
+                entreguesTotal
+            );
+
+        const ticketMedioCentavos =
+            pedidosTotal > 0
+                ? Math.round(
+                    Number(
+                        total.faturamento_centavos ||
+                        0
+                    ) /
+                    pedidosTotal
+                )
+                : 0;
+
+        const maiorCliente =
+            db.prepare(`
+                SELECT
+                    discord_id,
+                    SUM(
+                        valor_centavos
+                    ) AS total_centavos,
+                    COUNT(*) AS compras
+                FROM compras
+                GROUP BY
+                    discord_id
+                ORDER BY
+                    total_centavos DESC
+                LIMIT 1
+            `).get();
+
+        const cupomMaisUsado =
+            db.prepare(`
+                SELECT
+                    cupom_codigo AS codigo,
+                    COUNT(*) AS usos,
+                    SUM(
+                        desconto_centavos
+                    ) AS desconto_centavos
+                FROM compras
+                WHERE
+                    cupom_codigo IS NOT NULL
+                    AND TRIM(
+                        cupom_codigo
+                    ) <> ''
+                GROUP BY
+                    cupom_codigo
+                ORDER BY
+                    usos DESC,
+                    desconto_centavos DESC
+                LIMIT 1
+            `).get();
+
+        const maiorVenda =
+            db.prepare(`
+                SELECT
+                    discord_id,
+                    valor_centavos,
+                    quantidade_robux,
+                    produto
+                FROM compras
+                ORDER BY
+                    valor_centavos DESC
+                LIMIT 1
+            `).get();
+
+        const embed =
+            new EmbedBuilder()
+                .setColor(
+                    "#00db0f"
+                )
+                .setTitle(
+                    "<:greencart:1548089836647485591> Painel de vendas — RZ Store"
+                )
+                .setDescription(
+                    montarLinhaResumoVendas(
+                        "Hoje",
+                        hoje
+                    ) +
+                    "\n\n\n" +
+                    montarLinhaResumoVendas(
+                        "Últimos 7 dias",
+                        seteDias
+                    ) +
+                    "\n\n\n" +
+                    montarLinhaResumoVendas(
+                        "Últimos 30 dias",
+                        trintaDias
+                    ) +
+                    "\n\n\n" +
+                    montarLinhaResumoVendas(
+                        "Desde o início",
+                        total
+                    )
+                )
+                .addFields(
+                    {
+                        name:
+                            "<:cliente:1548196941102317568> Clientes",
+                        value:
+                            `> **Clientes únicos:** ${Number(total?.clientes_unicos || 0)}\n` +
+                            `> **Ticket médio:** ${formatarMoedaCentavos(ticketMedioCentavos)}`,
+                        inline:
+                            false
+                    },
+                    {
+                        name:
+                            "<a:greenverification:1548192162653536336> Entregas",
+                        value:
+                            `> **Entregues:** ${entreguesTotal}\n` +
+                            `> **Aguardando entrega:** ${aguardandoEntrega}`,
+                        inline:
+                            false
+                    },
+                    {
+                        name:
+                            "<:cupom:1548097312046186559> Descontos",
+                        value:
+                            `> **Concedidos:** ${formatarMoedaCentavos(total?.descontos_centavos)}\n` +
+                            (
+                                cupomMaisUsado
+                                    ? `> **Cupom mais usado:** ${cupomMaisUsado.codigo} — ${Number(cupomMaisUsado.usos)} usos`
+                                    : "> **Cupom mais usado:** —"
+                            ),
+                        inline:
+                            false
+                    }
+                );
+
+        if (maiorVenda) {
+
+            const descricaoMaiorVenda =
+                maiorVenda.produto
+                    ? maiorVenda.produto
+                    : `${formatarRobux(maiorVenda.quantidade_robux)} Robux`;
+
+            embed.addFields({
+                name:
+                    "<:esmeralda:1548188465508909118> Maior venda",
+                value:
+                    `> **Pedido:** ${descricaoMaiorVenda}\n` +
+                    `> **Valor:** ${formatarMoedaCentavos(maiorVenda.valor_centavos)}\n` +
+                    `> **Cliente:** <@${maiorVenda.discord_id}>`,
+                inline:
+                    false
+            });
+        }
+
+        if (maiorCliente) {
+
+            embed.addFields({
+                name:
+                    "<:cliente:1548196941102317568> Maior cliente",
+                value:
+                    `> **Cliente:** <@${maiorCliente.discord_id}>\n` +
+                    `> **Total gasto:** ${formatarMoedaCentavos(maiorCliente.total_centavos)}\n` +
+                    `> **Compras:** ${Number(maiorCliente.compras)}`,
+                inline:
+                    false
+            });
+        }
+
+        embed
+            .setFooter({
+                text:
+                    MERCADO_PAGO_TEST_MODE
+                        ? "RZ Store • Painel de vendas • BANCO DE TESTE"
+                        : "RZ Store • Painel de vendas • Atualização automática"
+            })
+            .setTimestamp();
+
+        const config =
+            db.prepare(`
+                SELECT valor
+                FROM configuracoes
+                WHERE chave =
+                    'painel_vendas_message_id'
+            `).get();
+
+        let mensagem = null;
+
+        if (
+            config?.valor
+        ) {
+
+            try {
+
+                mensagem =
+                    await canal.messages.fetch(
+                        config.valor
+                    );
+
+            } catch {
+
+                mensagem =
+                    null;
+            }
+        }
+
+        if (mensagem) {
+
+            await mensagem.edit({
+                embeds: [
+                    embed
+                ],
+                allowedMentions: {
+                    parse: []
+                }
+            });
+
+            return {
+                atualizado:
+                    true,
+                criado:
+                    false,
+                mensagem,
+                canal
+            };
+        }
+
+        const novaMensagem =
+            await canal.send({
+                embeds: [
+                    embed
+                ],
+                allowedMentions: {
+                    parse: []
+                }
+            });
+
+        db.prepare(`
+            INSERT INTO configuracoes (
+                chave,
+                valor
+            )
+            VALUES (
+                'painel_vendas_message_id',
+                ?
+            )
+
+            ON CONFLICT(chave)
+            DO UPDATE SET
+                valor =
+                    excluded.valor
+        `).run(
+            novaMensagem.id
+        );
+
+        return {
+            atualizado:
+                true,
+            criado:
+                true,
+            mensagem:
+                novaMensagem,
+            canal
+        };
+
+    } catch (error) {
+
+        console.error(
+            "[VENDAS] Erro ao atualizar painel:",
+            error
+        );
+
+        return {
+            atualizado:
+                false,
+            erro:
+                error
+        };
+    }
+}
+
+
 async function atualizarPainelEstoque(
     guild,
     {
@@ -4015,6 +4449,10 @@ async function processarOrderAprovada(orderId) {
             guild
         );
 
+        await atualizarPainelVendas(
+            guild
+        );
+
         if (cupomCodigo) {
             await atualizarPainelCupons(
                 guild
@@ -4337,6 +4775,15 @@ client.once("clientReady", async () => {
             guildEstoque
         );
 
+        if (
+            process.env.CANAL_VENDAS_ID
+        ) {
+
+            await atualizarPainelVendas(
+                guildEstoque
+            );
+        }
+
         setInterval(
             async () => {
 
@@ -4346,6 +4793,22 @@ client.once("clientReady", async () => {
 
             },
             10 * 60 * 1000
+        );
+
+        setInterval(
+            async () => {
+
+                if (
+                    process.env.CANAL_VENDAS_ID
+                ) {
+
+                    await atualizarPainelVendas(
+                        guildEstoque
+                    );
+                }
+
+            },
+            5 * 60 * 1000
         );
 
         setInterval(
@@ -4432,6 +4895,10 @@ client.once("clientReady", async () => {
         new SlashCommandBuilder()
             .setName("anunciarestoque")
             .setDescription("Publica o estoque atual no canal público"),
+
+        new SlashCommandBuilder()
+            .setName("vendas")
+            .setDescription("Cria ou atualiza o painel fixo de vendas"),
 
         new SlashCommandBuilder()
             .setName("criarcupom")
@@ -5063,6 +5530,79 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
     }
+
+    // =========================================
+    // PAINEL FIXO DE VENDAS
+    // =========================================
+
+    if (
+        interaction.isChatInputCommand() &&
+        interaction.commandName ===
+            "vendas"
+    ) {
+
+        if (
+            !interaction.member.roles.cache.has(
+                process.env.STAFF_ROLE_ID
+            )
+        ) {
+
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode usar este comando.",
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        if (
+            !process.env.CANAL_VENDAS_ID
+        ) {
+
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Configure `CANAL_VENDAS_ID` no `.env` primeiro.",
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        await interaction.deferReply({
+            flags:
+                MessageFlags.Ephemeral
+        });
+
+        const resultado =
+            await atualizarPainelVendas(
+                interaction.guild
+            );
+
+        if (
+            !resultado.atualizado
+        ) {
+
+            await interaction.editReply({
+                content:
+                    `<:x_:1549124126575165533> Não consegui atualizar o painel de vendas${resultado.erro?.message ? `: ${resultado.erro.message}` : "."}`
+            });
+
+            return;
+        }
+
+        await interaction.editReply({
+            content:
+                resultado.criado
+                    ? `<:okk:1549125132906270851> Painel de vendas criado em ${resultado.canal}. A partir de agora ele será atualizado automaticamente.`
+                    : `<:okk:1549125132906270851> Painel de vendas atualizado em ${resultado.canal}.`
+        });
+
+        return;
+    }
+
 
     // =========================================
     // COMANDOS DE ESTOQUE
@@ -7456,6 +7996,10 @@ client.on(Events.InteractionCreate, async interaction => {
 
                     return;
                 }
+
+                await atualizarPainelVendas(
+                    interaction.guild
+                );
 
                 const compra =
                     db.prepare(`
