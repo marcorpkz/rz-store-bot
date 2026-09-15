@@ -1,2 +1,11 @@
+
+# dependencias
 node_modules
+
+# variaveis privadas
 .env
+
+# Banco SQLite
+*.db
+*.db-shm
+*.db-wal

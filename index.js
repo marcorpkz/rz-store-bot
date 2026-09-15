@@ -32,6 +32,7 @@ const express = require("express");
 
 const QRCode = require("qrcode");
 const { randomUUID, createHmac, timingSafeEqual } = require("crypto");
+const { DatabaseSync } = require("node:sqlite");
 
 const mercadoPagoClient = new MercadoPagoConfig({
     accessToken: process.env.MERCADO_PAGO_ACCESS_TOKEN,
@@ -44,6 +45,46 @@ const mercadoPagoOrder = new Order(mercadoPagoClient);
 
 const MERCADO_PAGO_TEST_MODE =
     process.env.MERCADO_PAGO_TEST_MODE === "true";
+
+const CARGOS_EM_TESTE =
+    process.env.CARGOS_EM_TESTE === "true";
+
+// Banco de teste separado do banco real.
+// Assim, os testes do Mercado Pago não misturam os gastos reais.
+const DATABASE_FILE =
+    MERCADO_PAGO_TEST_MODE
+        ? "./rz-store-test.db"
+        : "./rz-store.db";
+
+const db = new DatabaseSync(DATABASE_FILE);
+
+db.exec(`
+    CREATE TABLE IF NOT EXISTS clientes (
+        discord_id TEXT PRIMARY KEY,
+        total_centavos INTEGER NOT NULL DEFAULT 0,
+        compras INTEGER NOT NULL DEFAULT 0,
+        criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        atualizado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS compras (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id TEXT NOT NULL UNIQUE,
+        payment_id TEXT,
+        discord_id TEXT NOT NULL,
+        valor_centavos INTEGER NOT NULL,
+        quantidade_robux INTEGER,
+        produto TEXT,
+        criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_compras_discord_id
+    ON compras(discord_id);
+`);
+
+console.log(
+    `[BANCO] SQLite carregado: ${DATABASE_FILE}`
+);
 
 const app = express();
 app.use(express.json());
@@ -284,6 +325,261 @@ function validarAssinaturaMercadoPago({
 }
 
 
+
+function registrarCompraAprovada({
+    orderId,
+    paymentId,
+    discordId,
+    valorCentavos,
+    quantidadeRobux,
+    produto
+}) {
+
+    const compraExistente =
+        db.prepare(`
+            SELECT order_id
+            FROM compras
+            WHERE order_id = ?
+        `).get(orderId);
+
+    if (compraExistente) {
+
+        const cliente =
+            db.prepare(`
+                SELECT total_centavos, compras
+                FROM clientes
+                WHERE discord_id = ?
+            `).get(discordId);
+
+        return {
+            novaCompra: false,
+            totalCentavos:
+                cliente?.total_centavos || 0,
+            numeroCompras:
+                cliente?.compras || 0
+        };
+    }
+
+    db.exec("BEGIN IMMEDIATE");
+
+    try {
+
+        db.prepare(`
+            INSERT INTO compras (
+                order_id,
+                payment_id,
+                discord_id,
+                valor_centavos,
+                quantidade_robux,
+                produto
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        `).run(
+            orderId,
+            paymentId || null,
+            discordId,
+            valorCentavos,
+            quantidadeRobux || null,
+            produto || null
+        );
+
+        db.prepare(`
+            INSERT INTO clientes (
+                discord_id,
+                total_centavos,
+                compras
+            )
+            VALUES (?, ?, 1)
+
+            ON CONFLICT(discord_id)
+            DO UPDATE SET
+                total_centavos =
+                    clientes.total_centavos +
+                    excluded.total_centavos,
+
+                compras =
+                    clientes.compras + 1,
+
+                atualizado_em =
+                    CURRENT_TIMESTAMP
+        `).run(
+            discordId,
+            valorCentavos
+        );
+
+        const cliente =
+            db.prepare(`
+                SELECT total_centavos, compras
+                FROM clientes
+                WHERE discord_id = ?
+            `).get(discordId);
+
+        db.exec("COMMIT");
+
+        return {
+            novaCompra: true,
+            totalCentavos:
+                cliente.total_centavos,
+            numeroCompras:
+                cliente.compras
+        };
+
+    } catch (error) {
+
+        db.exec("ROLLBACK");
+
+        throw error;
+    }
+}
+
+
+function obterCargoPorTotal(
+    totalCentavos
+) {
+
+    const cargos = [
+        {
+            nome: "Tigre",
+            minimo: 500000,
+            id: process.env.ROLE_TIGRE_ID
+        },
+        {
+            nome: "Coruja",
+            minimo: 100000,
+            id: process.env.ROLE_CORUJA_ID
+        },
+        {
+            nome: "Lobo",
+            minimo: 50000,
+            id: process.env.ROLE_LOBO_ID
+        },
+        {
+            nome: "Cervo",
+            minimo: 25000,
+            id: process.env.ROLE_CERVO_ID
+        },
+        {
+            nome: "Coelho",
+            minimo: 10000,
+            id: process.env.ROLE_COELHO_ID
+        },
+        {
+            nome: "Sapo",
+            minimo: 1,
+            id: process.env.ROLE_SAPO_ID
+        }
+    ];
+
+    return (
+        cargos.find(
+            cargo =>
+                totalCentavos >=
+                cargo.minimo
+        ) || null
+    );
+}
+
+
+function obterTodosIdsCargosClientes() {
+
+    return [
+        process.env.ROLE_SAPO_ID,
+        process.env.ROLE_COELHO_ID,
+        process.env.ROLE_CERVO_ID,
+        process.env.ROLE_LOBO_ID,
+        process.env.ROLE_CORUJA_ID,
+        process.env.ROLE_TIGRE_ID
+    ].filter(Boolean);
+}
+
+
+async function atualizarCargoCliente({
+    guild,
+    discordId,
+    totalCentavos
+}) {
+
+    const cargoCorreto =
+        obterCargoPorTotal(
+            totalCentavos
+        );
+
+    if (!cargoCorreto) {
+        return null;
+    }
+
+    if (
+        MERCADO_PAGO_TEST_MODE &&
+        !CARGOS_EM_TESTE
+    ) {
+
+        console.log(
+            `[CARGOS] Modo de teste: ${cargoCorreto.nome} não foi aplicado.`
+        );
+
+        return {
+            nome: cargoCorreto.nome,
+            id: cargoCorreto.id || null,
+            aplicado: false
+        };
+    }
+
+    if (!cargoCorreto.id) {
+
+        console.warn(
+            `[CARGOS] ID do cargo ${cargoCorreto.nome} não está configurado no .env.`
+        );
+
+        return {
+            nome: cargoCorreto.nome,
+            id: null,
+            aplicado: false
+        };
+    }
+
+    const member =
+        await guild.members.fetch(
+            discordId
+        );
+
+    const todosIds =
+        obterTodosIdsCargosClientes();
+
+    const idsParaRemover =
+        todosIds.filter(
+            id =>
+                id !== cargoCorreto.id &&
+                member.roles.cache.has(id)
+        );
+
+    if (idsParaRemover.length > 0) {
+
+        await member.roles.remove(
+            idsParaRemover,
+            "Atualização automática de cargo por gastos na RZ Store"
+        );
+    }
+
+    if (
+        !member.roles.cache.has(
+            cargoCorreto.id
+        )
+    ) {
+
+        await member.roles.add(
+            cargoCorreto.id,
+            `Total gasto na RZ Store: R$ ${(totalCentavos / 100).toFixed(2)}`
+        );
+    }
+
+    return {
+        nome: cargoCorreto.nome,
+        id: cargoCorreto.id,
+        aplicado: true
+    };
+}
+
+
 async function processarOrderAprovada(orderId) {
 
     try {
@@ -386,6 +682,123 @@ async function processarOrderAprovada(orderId) {
                 }
             );
 
+        // O sandbox do Mercado Pago cobra R$ 50,00 fixos.
+        // Para o histórico usamos o valor REAL do pedido salvo
+        // no tópico do ticket.
+        const valorCentavosPedido =
+            Number(
+                ticket.topic
+                    ?.match(
+                        /valor-centavos:(\d+)/
+                    )?.[1]
+            );
+
+        const quantidadeRobux =
+            Number(
+                ticket.topic
+                    ?.match(
+                        /robux:(\d+)/
+                    )?.[1]
+            );
+
+        const produto =
+            ticket.topic
+                ?.match(
+                    /Produto:\s*([^|]+)/
+                )?.[1]
+                ?.trim() ||
+            (
+                Number.isFinite(
+                    quantidadeRobux
+                )
+                    ? `${quantidadeRobux.toLocaleString("pt-BR")} Robux`
+                    : "Compra RZ Store"
+            );
+
+        if (
+            !donoTicket ||
+            !Number.isInteger(
+                valorCentavosPedido
+            ) ||
+            valorCentavosPedido <= 0
+        ) {
+
+            throw new Error(
+                "Não foi possível identificar o cliente ou o valor real do pedido no tópico do ticket."
+            );
+        }
+
+        const registro =
+            registrarCompraAprovada({
+                orderId,
+                paymentId,
+                discordId:
+                    donoTicket,
+                valorCentavos:
+                    valorCentavosPedido,
+                quantidadeRobux:
+                    Number.isFinite(
+                        quantidadeRobux
+                    )
+                        ? quantidadeRobux
+                        : null,
+                produto
+            });
+
+        let cargoAtual = null;
+
+        try {
+
+            cargoAtual =
+                await atualizarCargoCliente({
+                    guild,
+                    discordId:
+                        donoTicket,
+                    totalCentavos:
+                        registro.totalCentavos
+                });
+
+        } catch (cargoError) {
+
+            console.error(
+                "[CARGOS] Erro ao atualizar cargo do cliente:",
+                cargoError
+            );
+        }
+
+        const totalGastoFormatado =
+            (
+                registro.totalCentavos /
+                100
+            ).toLocaleString(
+                "pt-BR",
+                {
+                    style: "currency",
+                    currency: "BRL"
+                }
+            );
+
+        const valorPedidoFormatado =
+            (
+                valorCentavosPedido /
+                100
+            ).toLocaleString(
+                "pt-BR",
+                {
+                    style: "currency",
+                    currency: "BRL"
+                }
+            );
+
+        const cargoTexto =
+            cargoAtual?.id &&
+            cargoAtual?.aplicado
+                ? `<@&${cargoAtual.id}>`
+                : (
+                    cargoAtual?.nome ||
+                    "Não configurado"
+                );
+
         const embedPagamento =
             new EmbedBuilder()
                 .setColor("#00db0f")
@@ -397,7 +810,15 @@ async function processarOrderAprovada(orderId) {
 
                     `> **Order:** \`${orderId}\`\n` +
                     `> **Pagamento:** \`${paymentId}\`\n` +
-                    `> **Valor recebido:** ${valorPagoFormatado}\n\n` +
+                    `> **Valor do pedido:** ${valorPedidoFormatado}\n` +
+                    (
+                        MERCADO_PAGO_TEST_MODE
+                            ? `> **Cobrança sandbox:** ${valorPagoFormatado}\n`
+                            : ""
+                    ) +
+                    `> **Total gasto na loja:** ${totalGastoFormatado}\n` +
+                    `> **Cargo atual:** ${cargoTexto}\n` +
+                    `> **Compras aprovadas:** ${registro.numeroCompras}\n\n` +
 
                     "### <:okk:1549125132906270851> Status\n" +
                     "> **Pagamento aprovado e creditado.**\n\n" +
@@ -452,8 +873,6 @@ async function processarOrderAprovada(orderId) {
             `[WEBHOOK] Pagamento confirmado para a order ${orderId}.`
         );
 
-        // AQUI depois vamos registrar o gasto no SQLite
-        // e atualizar o cargo do cliente.
 
     } catch (error) {
 
@@ -605,7 +1024,23 @@ client.once("clientReady", async () => {
 
         new SlashCommandBuilder()
             .setName("korblox")
-            .setDescription("Cria o painel de Korblox e Headless")
+            .setDescription("Cria o painel de Korblox e Headless"),
+
+        new SlashCommandBuilder()
+            .setName("cliente")
+            .setDescription("Mostra o histórico de um cliente da RZ Store")
+            .addUserOption(option =>
+                option
+                    .setName("usuario")
+                    .setDescription("Cliente que você deseja consultar")
+                    .setRequired(false)
+            )
+            .addStringOption(option =>
+                option
+                    .setName("id")
+                    .setDescription("ID do Discord do cliente")
+                    .setRequired(false)
+            )
     ].map(command => command.toJSON());
 
     const rest = new REST({ version: "10" })
@@ -623,7 +1058,7 @@ client.once("clientReady", async () => {
             }
         );
 
-        console.log("Comandos /setupcomprar e /korblox registrados no servidor.");
+        console.log("Comandos /setupcomprar, /korblox e /cliente registrados no servidor.");
 
     } catch (error) {
 
@@ -810,6 +1245,325 @@ async function enviarPixNoTicket(interaction, dados, valorCentavos) {
 
 
 client.on(Events.InteractionCreate, async interaction => {
+
+    // =========================================
+    // COMANDO /cliente
+    // =========================================
+
+    if (
+        interaction.isChatInputCommand() &&
+        interaction.commandName === "cliente"
+    ) {
+
+        if (
+            !interaction.member.roles.cache.has(
+                process.env.STAFF_ROLE_ID
+            )
+        ) {
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode usar este comando.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        const usuarioSelecionado =
+            interaction.options.getUser(
+                "usuario",
+                false
+            );
+
+        const idDigitado =
+            interaction.options.getString(
+                "id",
+                false
+            )?.trim();
+
+        if (
+            !usuarioSelecionado &&
+            !idDigitado
+        ) {
+            await interaction.reply({
+                content:
+                    "<:interrogacoes:1548096277856649296> Informe um usuário ou o ID do Discord do cliente.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        if (
+            usuarioSelecionado &&
+            idDigitado
+        ) {
+            await interaction.reply({
+                content:
+                    "<:interrogacoes:1548096277856649296> Use apenas uma opção: **usuario** ou **id**.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        const discordId =
+            usuarioSelecionado?.id ||
+            idDigitado;
+
+        if (
+            !/^\d{15,25}$/.test(
+                discordId
+            )
+        ) {
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> O ID do Discord informado é inválido.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        const cliente =
+            db.prepare(`
+                SELECT
+                    discord_id,
+                    total_centavos,
+                    compras,
+                    criado_em,
+                    atualizado_em
+                FROM clientes
+                WHERE discord_id = ?
+            `).get(discordId);
+
+        if (!cliente) {
+
+            await interaction.reply({
+                content:
+                    `<:interrogacoes:1548096277856649296> Não encontrei nenhuma compra aprovada registrada para o ID \`${discordId}\`.`,
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        let usuario = usuarioSelecionado;
+
+        if (!usuario) {
+            try {
+                usuario =
+                    await client.users.fetch(
+                        discordId
+                    );
+            } catch {
+                usuario = null;
+            }
+        }
+
+        const totalCentavos =
+            Number(
+                cliente.total_centavos || 0
+            );
+
+        const totalFormatado =
+            (
+                totalCentavos / 100
+            ).toLocaleString(
+                "pt-BR",
+                {
+                    style: "currency",
+                    currency: "BRL"
+                }
+            );
+
+        const cargoAtual =
+            obterCargoPorTotal(
+                totalCentavos
+            );
+
+        const faixas = [
+            {
+                nome: "Sapo",
+                minimo: 1,
+                id: process.env.ROLE_SAPO_ID
+            },
+            {
+                nome: "Coelho",
+                minimo: 10000,
+                id: process.env.ROLE_COELHO_ID
+            },
+            {
+                nome: "Cervo",
+                minimo: 25000,
+                id: process.env.ROLE_CERVO_ID
+            },
+            {
+                nome: "Lobo",
+                minimo: 50000,
+                id: process.env.ROLE_LOBO_ID
+            },
+            {
+                nome: "Coruja",
+                minimo: 100000,
+                id: process.env.ROLE_CORUJA_ID
+            },
+            {
+                nome: "Tigre",
+                minimo: 500000,
+                id: process.env.ROLE_TIGRE_ID
+            }
+        ];
+
+        const proximoCargo =
+            faixas.find(
+                faixa =>
+                    faixa.minimo >
+                    totalCentavos
+            );
+
+        let textoProximoCargo;
+
+        if (proximoCargo) {
+
+            const faltamCentavos =
+                proximoCargo.minimo -
+                totalCentavos;
+
+            const faltamFormatado =
+                (
+                    faltamCentavos / 100
+                ).toLocaleString(
+                    "pt-BR",
+                    {
+                        style: "currency",
+                        currency: "BRL"
+                    }
+                );
+
+            textoProximoCargo =
+                proximoCargo.id
+                    ? `<@&${proximoCargo.id}> — faltam **${faltamFormatado}**`
+                    : `**${proximoCargo.nome}** — faltam **${faltamFormatado}**`;
+
+        } else {
+
+            textoProximoCargo =
+                "<:coroa:1548189671501078588> Cargo máximo alcançado";
+        }
+
+        const textoCargoAtual =
+            cargoAtual?.id
+                ? `<@&${cargoAtual.id}>`
+                : (
+                    cargoAtual?.nome ||
+                    "Sem cargo"
+                );
+
+        const comprasRecentes =
+            db.prepare(`
+                SELECT
+                    quantidade_robux,
+                    produto,
+                    valor_centavos,
+                    criado_em
+                FROM compras
+                WHERE discord_id = ?
+                ORDER BY id DESC
+                LIMIT 3
+            `).all(discordId);
+
+        let textoUltimasCompras =
+            "Nenhuma compra encontrada.";
+
+        if (
+            comprasRecentes.length > 0
+        ) {
+
+            textoUltimasCompras =
+                comprasRecentes
+                    .map(
+                        compra => {
+
+                            const valor =
+                                (
+                                    Number(
+                                        compra.valor_centavos
+                                    ) / 100
+                                ).toLocaleString(
+                                    "pt-BR",
+                                    {
+                                        style: "currency",
+                                        currency: "BRL"
+                                    }
+                                );
+
+                            const item =
+                                compra.quantidade_robux
+                                    ? `${Number(
+                                        compra.quantidade_robux
+                                    ).toLocaleString(
+                                        "pt-BR"
+                                    )} Robux`
+                                    : (
+                                        compra.produto ||
+                                        "Compra"
+                                    );
+
+                            return (
+                                `> **${item}** — ${valor}`
+                            );
+                        }
+                    )
+                    .join("\n");
+        }
+
+        const embedCliente =
+            new EmbedBuilder()
+                .setColor("#00db0f")
+                .setAuthor({
+                    name:
+                        usuario
+                            ? `${usuario.username} • Cliente RZ Store`
+                            : `Cliente ${discordId} • RZ Store`,
+                    ...(usuario
+                        ? {
+                            iconURL:
+                                usuario.displayAvatarURL()
+                        }
+                        : {})
+                })
+                .setDescription(
+                    `> **Cliente:** ${usuario || `<@${discordId}>`}\n` +
+                    `> **Discord ID:** \`${discordId}\`\n\n` +
+
+                    `### <:pix:1548090281402966107> Histórico\n` +
+                    `> **Total gasto:** ${totalFormatado}\n` +
+                    `> **Compras aprovadas:** ${cliente.compras}\n\n` +
+
+                    `### <:coroa:1548189671501078588> Fidelidade\n` +
+                    `> **Cargo atual:** ${textoCargoAtual}\n` +
+                    `> **Próximo cargo:** ${textoProximoCargo}\n\n` +
+
+                    `### <:greenrbx:1548088739677470881> Últimas compras\n` +
+                    textoUltimasCompras
+                )
+                .setFooter({
+                    text:
+                        MERCADO_PAGO_TEST_MODE
+                            ? "RZ Store • Banco de TESTE"
+                            : "RZ Store • Histórico do cliente"
+                })
+                .setTimestamp();
+
+        await interaction.reply({
+            embeds: [
+                embedCliente
+            ]
+        });
+
+        return;
+    }
 
     // =========================================
     // COMANDO /setupcomprar
