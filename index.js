@@ -32,6 +32,7 @@ const express = require("express");
 
 const QRCode = require("qrcode");
 const { randomUUID, createHmac, timingSafeEqual } = require("crypto");
+const path = require("path");
 const { DatabaseSync } = require("node:sqlite");
 
 const mercadoPagoClient = new MercadoPagoConfig({
@@ -80,7 +81,75 @@ db.exec(`
 
     CREATE INDEX IF NOT EXISTS idx_compras_discord_id
     ON compras(discord_id);
+
+    CREATE TABLE IF NOT EXISTS estoque (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        quantidade INTEGER NOT NULL DEFAULT 0,
+        atualizado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    INSERT OR IGNORE INTO estoque (
+        id,
+        quantidade
+    )
+    VALUES (1, 0);
+
+    CREATE TABLE IF NOT EXISTS estoque_movimentos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tipo TEXT NOT NULL,
+        quantidade INTEGER NOT NULL,
+        saldo_apos INTEGER NOT NULL,
+        referencia TEXT UNIQUE,
+        staff_discord_id TEXT,
+        criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
 `);
+
+// Migra bancos antigos sem apagar nenhum dado.
+const colunasCompras =
+    db.prepare(
+        "PRAGMA table_info(compras)"
+    ).all();
+
+const nomesColunasCompras =
+    new Set(
+        colunasCompras.map(
+            coluna => coluna.name
+        )
+    );
+
+if (
+    !nomesColunasCompras.has(
+        "entregue"
+    )
+) {
+    db.exec(`
+        ALTER TABLE compras
+        ADD COLUMN entregue INTEGER NOT NULL DEFAULT 0
+    `);
+}
+
+if (
+    !nomesColunasCompras.has(
+        "entregue_em"
+    )
+) {
+    db.exec(`
+        ALTER TABLE compras
+        ADD COLUMN entregue_em TEXT
+    `);
+}
+
+if (
+    !nomesColunasCompras.has(
+        "entregue_por"
+    )
+) {
+    db.exec(`
+        ALTER TABLE compras
+        ADD COLUMN entregue_por TEXT
+    `);
+}
 
 console.log(
     `[BANCO] SQLite carregado: ${DATABASE_FILE}`
@@ -326,6 +395,228 @@ function validarAssinaturaMercadoPago({
 
 
 
+function obterQuantidadeEstoque() {
+
+    const linha =
+        db.prepare(`
+            SELECT quantidade
+            FROM estoque
+            WHERE id = 1
+        `).get();
+
+    return Number(
+        linha?.quantidade || 0
+    );
+}
+
+
+function formatarRobux(
+    quantidade
+) {
+
+    return Number(
+        quantidade || 0
+    ).toLocaleString(
+        "pt-BR"
+    );
+}
+
+
+function alterarEstoqueManual({
+    quantidade,
+    tipo,
+    staffDiscordId
+}) {
+
+    if (
+        !Number.isInteger(quantidade) ||
+        quantidade <= 0
+    ) {
+        throw new Error(
+            "A quantidade do estoque deve ser um número inteiro maior que zero."
+        );
+    }
+
+    db.exec(
+        "BEGIN IMMEDIATE"
+    );
+
+    try {
+
+        const estoqueAntes =
+            obterQuantidadeEstoque();
+
+        let estoqueDepois;
+
+        if (tipo === "entrada") {
+
+            estoqueDepois =
+                estoqueAntes +
+                quantidade;
+
+        } else if (
+            tipo === "saida_manual"
+        ) {
+
+            if (
+                quantidade >
+                estoqueAntes
+            ) {
+                throw new Error(
+                    `Não há Robux suficientes no estoque. Saldo atual: ${formatarRobux(estoqueAntes)} Robux.`
+                );
+            }
+
+            estoqueDepois =
+                estoqueAntes -
+                quantidade;
+
+        } else {
+
+            throw new Error(
+                "Tipo de movimentação de estoque inválido."
+            );
+        }
+
+        db.prepare(`
+            UPDATE estoque
+            SET
+                quantidade = ?,
+                atualizado_em = CURRENT_TIMESTAMP
+            WHERE id = 1
+        `).run(
+            estoqueDepois
+        );
+
+        db.prepare(`
+            INSERT INTO estoque_movimentos (
+                tipo,
+                quantidade,
+                saldo_apos,
+                staff_discord_id
+            )
+            VALUES (?, ?, ?, ?)
+        `).run(
+            tipo,
+            tipo === "entrada"
+                ? quantidade
+                : -quantidade,
+            estoqueDepois,
+            staffDiscordId || null
+        );
+
+        db.exec(
+            "COMMIT"
+        );
+
+        return {
+            estoqueAntes,
+            estoqueDepois
+        };
+
+    } catch (error) {
+
+        db.exec(
+            "ROLLBACK"
+        );
+
+        throw error;
+    }
+}
+
+
+async function notificarEstoqueBaixo(
+    guild,
+    estoqueAntes,
+    estoqueDepois
+) {
+
+    const limite =
+        Number(
+            process.env.ESTOQUE_BAIXO_LIMITE ||
+            3000
+        );
+
+    if (
+        !Number.isFinite(limite) ||
+        limite < 0
+    ) {
+        return;
+    }
+
+    // Só avisa quando cruza o limite para baixo,
+    // evitando spam a cada venda.
+    if (
+        estoqueAntes <= limite ||
+        estoqueDepois > limite
+    ) {
+        return;
+    }
+
+    const canalId =
+        process.env.CANAL_ESTOQUE_ID ||
+        process.env.CANAL_LOGS_COMPRAS_ID;
+
+    if (!canalId) {
+        return;
+    }
+
+    try {
+
+        const canal =
+            await guild.channels.fetch(
+                canalId
+            );
+
+        if (
+            !canal ||
+            !canal.isTextBased()
+        ) {
+            return;
+        }
+
+        const embed =
+            new EmbedBuilder()
+                .setColor(
+                    "#00db0f"
+                )
+                .setTitle(
+                    "<:danger:1549129849904566392> Estoque baixo"
+                )
+                .setDescription(
+                    `O estoque da **RZ Store** chegou ao limite configurado.\n\n` +
+                    `> <:greenrbx:1548088739677470881> **Estoque atual:** ${formatarRobux(estoqueDepois)} Robux\n` +
+                    `> **Limite de aviso:** ${formatarRobux(limite)} Robux`
+                )
+                .setFooter({
+                    text:
+                        "RZ Store • Controle de estoque"
+                })
+                .setTimestamp();
+
+        await canal.send({
+            content:
+                `<@&${process.env.STAFF_ROLE_ID}>`,
+            embeds: [
+                embed
+            ],
+            allowedMentions: {
+                roles: [
+                    process.env.STAFF_ROLE_ID
+                ]
+            }
+        });
+
+    } catch (error) {
+
+        console.error(
+            "[ESTOQUE] Erro ao enviar alerta de estoque baixo:",
+            error
+        );
+    }
+}
+
+
 function registrarCompraAprovada({
     orderId,
     paymentId,
@@ -335,34 +626,119 @@ function registrarCompraAprovada({
     produto
 }) {
 
-    const compraExistente =
-        db.prepare(`
-            SELECT order_id
-            FROM compras
-            WHERE order_id = ?
-        `).get(orderId);
+    const quantidade =
+        Number(
+            quantidadeRobux
+        );
 
-    if (compraExistente) {
-
-        const cliente =
-            db.prepare(`
-                SELECT total_centavos, compras
-                FROM clientes
-                WHERE discord_id = ?
-            `).get(discordId);
-
-        return {
-            novaCompra: false,
-            totalCentavos:
-                cliente?.total_centavos || 0,
-            numeroCompras:
-                cliente?.compras || 0
-        };
+    if (
+        !Number.isInteger(
+            quantidade
+        ) ||
+        quantidade <= 0
+    ) {
+        throw new Error(
+            "Não foi possível identificar a quantidade de Robux para baixar do estoque."
+        );
     }
 
-    db.exec("BEGIN IMMEDIATE");
+    db.exec(
+        "BEGIN IMMEDIATE"
+    );
 
     try {
+
+        const compraExistente =
+            db.prepare(`
+                SELECT order_id
+                FROM compras
+                WHERE order_id = ?
+            `).get(orderId);
+
+        if (compraExistente) {
+
+            const cliente =
+                db.prepare(`
+                    SELECT
+                        total_centavos,
+                        compras
+                    FROM clientes
+                    WHERE discord_id = ?
+                `).get(discordId);
+
+            const estoqueAtual =
+                obterQuantidadeEstoque();
+
+            db.exec(
+                "COMMIT"
+            );
+
+            return {
+                novaCompra: false,
+                semEstoque: false,
+                totalCentavos:
+                    cliente?.total_centavos || 0,
+                numeroCompras:
+                    cliente?.compras || 0,
+                estoqueAntes:
+                    estoqueAtual,
+                estoqueDepois:
+                    estoqueAtual
+            };
+        }
+
+        const estoqueAntes =
+            obterQuantidadeEstoque();
+
+        if (
+            estoqueAntes <
+            quantidade
+        ) {
+
+            db.exec(
+                "ROLLBACK"
+            );
+
+            return {
+                novaCompra: false,
+                semEstoque: true,
+                totalCentavos: 0,
+                numeroCompras: 0,
+                estoqueAntes,
+                estoqueDepois:
+                    estoqueAntes
+            };
+        }
+
+        const estoqueDepois =
+            estoqueAntes -
+            quantidade;
+
+        db.prepare(`
+            UPDATE estoque
+            SET
+                quantidade = ?,
+                atualizado_em =
+                    CURRENT_TIMESTAMP
+            WHERE id = 1
+        `).run(
+            estoqueDepois
+        );
+
+        db.prepare(`
+            INSERT INTO estoque_movimentos (
+                tipo,
+                quantidade,
+                saldo_apos,
+                referencia
+            )
+            VALUES (?, ?, ?, ?)
+        `).run(
+            "venda",
+            -quantidade,
+            estoqueDepois,
+            `compra:${orderId}`
+        );
 
         db.prepare(`
             INSERT INTO compras (
@@ -379,7 +755,7 @@ function registrarCompraAprovada({
             paymentId || null,
             discordId,
             valorCentavos,
-            quantidadeRobux || null,
+            quantidade,
             produto || null
         );
 
@@ -409,29 +785,39 @@ function registrarCompraAprovada({
 
         const cliente =
             db.prepare(`
-                SELECT total_centavos, compras
+                SELECT
+                    total_centavos,
+                    compras
                 FROM clientes
                 WHERE discord_id = ?
             `).get(discordId);
 
-        db.exec("COMMIT");
+        db.exec(
+            "COMMIT"
+        );
 
         return {
             novaCompra: true,
+            semEstoque: false,
             totalCentavos:
                 cliente.total_centavos,
             numeroCompras:
-                cliente.compras
+                cliente.compras,
+            estoqueAntes,
+            estoqueDepois
         };
 
     } catch (error) {
 
-        db.exec("ROLLBACK");
+        try {
+            db.exec(
+                "ROLLBACK"
+            );
+        } catch {}
 
         throw error;
     }
 }
-
 
 function obterCargoPorTotal(
     totalCentavos
@@ -493,6 +879,229 @@ function obterTodosIdsCargosClientes() {
 }
 
 
+function obterNomeCargoPorId(id) {
+
+    const cargos = [
+        {
+            nome: "Sapo",
+            id: process.env.ROLE_SAPO_ID
+        },
+        {
+            nome: "Coelho",
+            id: process.env.ROLE_COELHO_ID
+        },
+        {
+            nome: "Cervo",
+            id: process.env.ROLE_CERVO_ID
+        },
+        {
+            nome: "Lobo",
+            id: process.env.ROLE_LOBO_ID
+        },
+        {
+            nome: "Coruja",
+            id: process.env.ROLE_CORUJA_ID
+        },
+        {
+            nome: "Tigre",
+            id: process.env.ROLE_TIGRE_ID
+        }
+    ];
+
+    return (
+        cargos.find(
+            cargo =>
+                cargo.id === id
+        )?.nome || null
+    );
+}
+
+
+function obterMetaCargo(nome) {
+
+    const metas = {
+        Sapo: "Primeira compra",
+        Coelho: "R$ 100+",
+        Cervo: "R$ 250+",
+        Lobo: "R$ 500+",
+        Coruja: "R$ 1.000+",
+        Tigre: "R$ 5.000+"
+    };
+
+    return metas[nome] || "";
+}
+
+
+function obterImagemCargo(nome) {
+
+    const arquivos = {
+        Sapo: "sapo.png",
+        Coelho: "coelho.png",
+        Cervo: "cervo.png",
+        Lobo: "lobo.png",
+        Coruja: "coruja.png",
+        Tigre: "tigre.png"
+    };
+
+    const nomeArquivo =
+        arquivos[nome];
+
+    if (!nomeArquivo) {
+        return null;
+    }
+
+    return {
+        nomeArquivo,
+        caminho: path.join(
+            __dirname,
+            "assets",
+            "evolucoes",
+            nomeArquivo
+        )
+    };
+}
+
+
+async function notificarEvolucaoCargo({
+    guild,
+    member,
+    cargoAnteriorId,
+    cargoNovo,
+    totalCentavos
+}) {
+
+    const canalId =
+        process.env.CANAL_EVOLUCAO_ID;
+
+    if (!canalId) {
+
+        console.warn(
+            "[CARGOS] CANAL_EVOLUCAO_ID não configurado no .env."
+        );
+
+        return;
+    }
+
+    try {
+
+        const canal =
+            await guild.channels.fetch(
+                canalId
+            );
+
+        if (
+            !canal ||
+            !canal.isTextBased()
+        ) {
+
+            console.warn(
+                "[CARGOS] Canal de evolução não encontrado ou não é um canal de texto."
+            );
+
+            return;
+        }
+
+        const nomeAnterior =
+            obterNomeCargoPorId(
+                cargoAnteriorId
+            );
+
+        const meta =
+            obterMetaCargo(
+                cargoNovo.nome
+            );
+
+        const totalFormatado =
+            (
+                totalCentavos / 100
+            ).toLocaleString(
+                "pt-BR",
+                {
+                    style: "currency",
+                    currency: "BRL"
+                }
+            );
+
+        const descricaoEvolucao =
+            nomeAnterior &&
+            cargoAnteriorId
+                ? `${member} evoluiu de <@&${cargoAnteriorId}> para <@&${cargoNovo.id}>!`
+                : `${member} conquistou o cargo <@&${cargoNovo.id}>!`;
+
+        const imagemCargo =
+            obterImagemCargo(
+                cargoNovo.nome
+            );
+
+        const embedEvolucao =
+            new EmbedBuilder()
+                .setColor("#00db0f")
+                .setAuthor({
+                    name:
+                        `${member.user.username} • Evolução de cliente`,
+                    iconURL:
+                        member.user.displayAvatarURL()
+                })
+                .setTitle(
+                    "<:coroa:1548189671501078588> Novo cargo conquistado!"
+                )
+                .setDescription(
+                    `${descricaoEvolucao}\n\n` +
+                    `> **Novo cargo:** <@&${cargoNovo.id}>\n` +
+                    `> **Meta do cargo:** ${meta}\n` +
+                    `> **Total acumulado:** ${totalFormatado}\n\n` +
+                    "<a:greenverification:1548192162653536336> Obrigado por comprar na **RZ Store**!"
+                )
+                .setThumbnail(
+                    member.user.displayAvatarURL()
+                )
+                .setFooter({
+                    text:
+                        "RZ Store • Sistema de fidelidade"
+                })
+                .setTimestamp();
+
+        if (imagemCargo) {
+
+            embedEvolucao.setImage(
+                `attachment://${imagemCargo.nomeArquivo}`
+            );
+        }
+
+        await canal.send({
+            content: `<@${member.id}>`,
+            embeds: [
+                embedEvolucao
+            ],
+            files:
+                imagemCargo
+                    ? [
+                        {
+                            attachment:
+                                imagemCargo.caminho,
+                            name:
+                                imagemCargo.nomeArquivo
+                        }
+                    ]
+                    : [],
+            allowedMentions: {
+                users: [
+                    member.id
+                ],
+                roles: []
+            }
+        });
+
+    } catch (error) {
+
+        console.error(
+            "[CARGOS] Erro ao enviar embed de evolução:",
+            error
+        );
+    }
+}
+
+
 async function atualizarCargoCliente({
     guild,
     discordId,
@@ -545,6 +1154,16 @@ async function atualizarCargoCliente({
     const todosIds =
         obterTodosIdsCargosClientes();
 
+    const cargoAnteriorId =
+        todosIds.find(
+            id =>
+                member.roles.cache.has(id)
+        ) || null;
+
+    const mudouDeCargo =
+        cargoAnteriorId !==
+        cargoCorreto.id;
+
     const idsParaRemover =
         todosIds.filter(
             id =>
@@ -572,15 +1191,46 @@ async function atualizarCargoCliente({
         );
     }
 
+    if (mudouDeCargo) {
+
+        await notificarEvolucaoCargo({
+            guild,
+            member,
+            cargoAnteriorId,
+            cargoNovo:
+                cargoCorreto,
+            totalCentavos
+        });
+    }
+
     return {
         nome: cargoCorreto.nome,
         id: cargoCorreto.id,
-        aplicado: true
+        aplicado: true,
+        mudou:
+            mudouDeCargo,
+        cargoAnteriorId
     };
 }
 
 
 async function processarOrderAprovada(orderId) {
+
+    if (
+        ordersEmProcessamento.has(
+            orderId
+        )
+    ) {
+        console.log(
+            `[WEBHOOK] Order ${orderId} já está sendo processada. Ignorando webhook duplicado.`
+        );
+
+        return;
+    }
+
+    ordersEmProcessamento.add(
+        orderId
+    );
 
     try {
 
@@ -745,6 +1395,83 @@ async function processarOrderAprovada(orderId) {
                 produto
             });
 
+        if (registro.semEstoque) {
+
+            const estoqueFormatado =
+                formatarRobux(
+                    registro.estoqueDepois
+                );
+
+            const quantidadeFormatada =
+                formatarRobux(
+                    quantidadeRobux
+                );
+
+            const embedSemEstoque =
+                new EmbedBuilder()
+                    .setColor(
+                        "#00db0f"
+                    )
+                    .setTitle(
+                        "<:danger:1549129849904566392> Pagamento aprovado — estoque insuficiente"
+                    )
+                    .setDescription(
+                        `O pagamento foi aprovado, mas o estoque atual não é suficiente para este pedido.
+
+` +
+                        `> **Pedido:** ${quantidadeFormatada} Robux
+` +
+                        `> **Estoque atual:** ${estoqueFormatado} Robux
+
+` +
+                        `<@&${process.env.STAFF_ROLE_ID}> verifique este pedido imediatamente.`
+                    )
+                    .setFooter({
+                        text:
+                            "RZ Store • Atenção necessária"
+                    })
+                    .setTimestamp();
+
+            await ticket.send({
+                content:
+                    `<@${donoTicket}> <@&${process.env.STAFF_ROLE_ID}>`,
+                embeds: [
+                    embedSemEstoque
+                ],
+                allowedMentions: {
+                    users: [
+                        donoTicket
+                    ],
+                    roles: [
+                        process.env.STAFF_ROLE_ID
+                    ]
+                }
+            });
+
+            console.error(
+                `[ESTOQUE] Pagamento ${orderId} aprovado sem estoque suficiente.`
+            );
+
+            return;
+        }
+
+        // A order já foi salva antes: não aplica cargo,
+        // não envia evolução e não manda confirmação novamente.
+        if (!registro.novaCompra) {
+
+            console.log(
+                `[WEBHOOK] Order ${orderId} já estava registrada no banco. Ignorando processamento duplicado.`
+            );
+
+            return;
+        }
+
+        await notificarEstoqueBaixo(
+            guild,
+            registro.estoqueAntes,
+            registro.estoqueDepois
+        );
+
         let cargoAtual = null;
 
         try {
@@ -881,6 +1608,11 @@ async function processarOrderAprovada(orderId) {
             error
         );
 
+    } finally {
+
+        ordersEmProcessamento.delete(
+            orderId
+        );
     }
 }
 
@@ -1013,6 +1745,10 @@ const client = new Client({
 // O botão também será desativado no Discord após o primeiro envio.
 const robloxNickEnviado = new Set();
 
+// O Mercado Pago pode enviar o mesmo webhook mais de uma vez.
+// Essa trava impede duas execuções simultâneas da mesma order.
+const ordersEmProcessamento = new Set();
+
 client.once("clientReady", async () => {
 
     console.log(`Bot online como ${client.user.tag}`);
@@ -1040,6 +1776,32 @@ client.once("clientReady", async () => {
                     .setName("id")
                     .setDescription("ID do Discord do cliente")
                     .setRequired(false)
+            ),
+
+        new SlashCommandBuilder()
+            .setName("estoque")
+            .setDescription("Mostra o estoque atual de Robux"),
+
+        new SlashCommandBuilder()
+            .setName("adicionarestoque")
+            .setDescription("Adiciona Robux ao estoque da loja")
+            .addIntegerOption(option =>
+                option
+                    .setName("quantidade")
+                    .setDescription("Quantidade de Robux que será adicionada")
+                    .setRequired(true)
+                    .setMinValue(1)
+            ),
+
+        new SlashCommandBuilder()
+            .setName("removerestoque")
+            .setDescription("Remove Robux do estoque da loja")
+            .addIntegerOption(option =>
+                option
+                    .setName("quantidade")
+                    .setDescription("Quantidade de Robux que será removida")
+                    .setRequired(true)
+                    .setMinValue(1)
             )
     ].map(command => command.toJSON());
 
@@ -1058,7 +1820,7 @@ client.once("clientReady", async () => {
             }
         );
 
-        console.log("Comandos /setupcomprar, /korblox e /cliente registrados no servidor.");
+        console.log("Comandos /setupcomprar, /korblox, /cliente, /estoque, /adicionarestoque e /removerestoque registrados no servidor.");
 
     } catch (error) {
 
@@ -1245,6 +2007,135 @@ async function enviarPixNoTicket(interaction, dados, valorCentavos) {
 
 
 client.on(Events.InteractionCreate, async interaction => {
+
+    // =========================================
+    // COMANDOS DE ESTOQUE
+    // =========================================
+
+    if (
+        interaction.isChatInputCommand() &&
+        [
+            "estoque",
+            "adicionarestoque",
+            "removerestoque"
+        ].includes(
+            interaction.commandName
+        )
+    ) {
+
+        if (
+            !interaction.member.roles.cache.has(
+                process.env.STAFF_ROLE_ID
+            )
+        ) {
+
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode usar este comando.",
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        if (
+            interaction.commandName ===
+            "estoque"
+        ) {
+
+            const estoqueAtual =
+                obterQuantidadeEstoque();
+
+            const embedEstoque =
+                new EmbedBuilder()
+                    .setColor(
+                        "#00db0f"
+                    )
+                    .setTitle(
+                        "<:greenrbx:1548088739677470881> Estoque da RZ Store"
+                    )
+                    .setDescription(
+                        `> **Disponível:** ${formatarRobux(estoqueAtual)} Robux`
+                    )
+                    .setFooter({
+                        text:
+                            MERCADO_PAGO_TEST_MODE
+                                ? "RZ Store • Estoque de TESTE"
+                                : "RZ Store • Controle de estoque"
+                    })
+                    .setTimestamp();
+
+            await interaction.reply({
+                embeds: [
+                    embedEstoque
+                ],
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        const quantidade =
+            interaction.options.getInteger(
+                "quantidade",
+                true
+            );
+
+        try {
+
+            const tipo =
+                interaction.commandName ===
+                "adicionarestoque"
+                    ? "entrada"
+                    : "saida_manual";
+
+            const resultado =
+                alterarEstoqueManual({
+                    quantidade,
+                    tipo,
+                    staffDiscordId:
+                        interaction.user.id
+                });
+
+            if (
+                tipo ===
+                "saida_manual"
+            ) {
+
+                await notificarEstoqueBaixo(
+                    interaction.guild,
+                    resultado.estoqueAntes,
+                    resultado.estoqueDepois
+                );
+            }
+
+            const acao =
+                tipo === "entrada"
+                    ? "adicionados"
+                    : "removidos";
+
+            await interaction.reply({
+                content:
+                    `<:okk:1549125132906270851> **${formatarRobux(quantidade)} Robux** foram ${acao} do estoque.\n` +
+                    `<:greenrbx:1548088739677470881> **Estoque atual:** ${formatarRobux(resultado.estoqueDepois)} Robux`,
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+        } catch (error) {
+
+            await interaction.reply({
+                content:
+                    `<:x_:1549124126575165533> ${error.message}`,
+                flags:
+                    MessageFlags.Ephemeral
+            });
+        }
+
+        return;
+    }
 
     // =========================================
     // COMANDO /cliente
@@ -2493,13 +3384,37 @@ client.on(Events.InteractionCreate, async interaction => {
                 })
                 .setTimestamp();
 
-            // Primeiro envia o embed. Assim, mesmo que a alteração
-            // do tópico falhe, os dados da entrega não são perdidos.
+            const botaoEntrega =
+                new ActionRowBuilder()
+                    .addComponents(
+                        new ButtonBuilder()
+                            .setCustomId(
+                                "marcar_entregue"
+                            )
+                            .setLabel(
+                                "Marcar como entregue"
+                            )
+                            .setEmoji({
+                                id:
+                                    "1549125132906270851",
+                                name:
+                                    "okk"
+                            })
+                            .setStyle(
+                                ButtonStyle.Success
+                            )
+                    );
+
             await interaction.channel.send({
                 content: `<@&${process.env.STAFF_ROLE_ID}>`,
                 embeds: [embedRoblox],
+                components: [
+                    botaoEntrega
+                ],
                 allowedMentions: {
-                    roles: [process.env.STAFF_ROLE_ID]
+                    roles: [
+                        process.env.STAFF_ROLE_ID
+                    ]
                 }
             });
 
@@ -2638,6 +3553,577 @@ client.on(Events.InteractionCreate, async interaction => {
             await interaction.showModal(
                 modalRoblox
             );
+
+            return;
+        }
+
+
+        // =========================================
+        // MARCAR PEDIDO COMO ENTREGUE
+        // =========================================
+
+        if (
+            interaction.customId ===
+            "marcar_entregue"
+        ) {
+
+            const ehStaff =
+                interaction.member.roles.cache.has(
+                    process.env.STAFF_ROLE_ID
+                );
+
+            if (!ehStaff) {
+
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode marcar um pedido como entregue.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            const orderId =
+                interaction.channel.topic
+                    ?.match(
+                        /mp-order:([^|]+)/
+                    )?.[1]
+                    ?.trim();
+
+            if (!orderId) {
+
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Não encontrei a Order deste pedido.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            const compra =
+                db.prepare(`
+                    SELECT
+                        order_id,
+                        entregue
+                    FROM compras
+                    WHERE order_id = ?
+                `).get(orderId);
+
+            if (!compra) {
+
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Esta compra ainda não está registrada no banco.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            if (
+                Number(compra.entregue) === 1
+            ) {
+
+                await interaction.reply({
+                    content:
+                        "<:danger:1549129849904566392> Este pedido já foi marcado como entregue.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            const confirmacao =
+                new ActionRowBuilder()
+                    .addComponents(
+                        new ButtonBuilder()
+                            .setCustomId(
+                                `confirmar_entrega_${interaction.message.id}`
+                            )
+                            .setLabel(
+                                "Confirmar entrega"
+                            )
+                            .setStyle(
+                                ButtonStyle.Success
+                            )
+                            .setEmoji({
+                                id:
+                                    "1549125132906270851",
+                                name:
+                                    "okk"
+                            }),
+
+                        new ButtonBuilder()
+                            .setCustomId(
+                                `cancelar_entrega_${interaction.message.id}`
+                            )
+                            .setLabel(
+                                "Cancelar"
+                            )
+                            .setStyle(
+                                ButtonStyle.Secondary
+                            )
+                    );
+
+            await interaction.reply({
+                content:
+                    "<:danger:1549129849904566392> Confirme apenas se os Robux já foram entregues ao cliente.",
+                components: [
+                    confirmacao
+                ],
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+
+        // =========================================
+        // CANCELAR CONFIRMAÇÃO DE ENTREGA
+        // =========================================
+
+        if (
+            interaction.customId.startsWith(
+                "cancelar_entrega_"
+            )
+        ) {
+
+            const ehStaff =
+                interaction.member.roles.cache.has(
+                    process.env.STAFF_ROLE_ID
+                );
+
+            if (!ehStaff) {
+
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Apenas a equipe pode realizar esta ação.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            await interaction.update({
+                content:
+                    "Entrega não foi marcada.",
+                components: []
+            });
+
+            return;
+        }
+
+
+        // =========================================
+        // CONFIRMAR ENTREGA
+        // =========================================
+
+        if (
+            interaction.customId.startsWith(
+                "confirmar_entrega_"
+            )
+        ) {
+
+            const ehStaff =
+                interaction.member.roles.cache.has(
+                    process.env.STAFF_ROLE_ID
+                );
+
+            if (!ehStaff) {
+
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode confirmar entregas.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            await interaction.deferUpdate();
+
+            const mensagemEntregaId =
+                interaction.customId.replace(
+                    "confirmar_entrega_",
+                    ""
+                );
+
+            const donoTicket =
+                interaction.channel.topic
+                    ?.match(
+                        /rzstore-user:(\d+)/
+                    )?.[1];
+
+            const orderId =
+                interaction.channel.topic
+                    ?.match(
+                        /mp-order:([^|]+)/
+                    )?.[1]
+                    ?.trim();
+
+            if (
+                !donoTicket ||
+                !orderId
+            ) {
+
+                await interaction.editReply({
+                    content:
+                        "<:x_:1549124126575165533> Não consegui identificar o cliente ou a Order deste pedido.",
+                    components: []
+                });
+
+                return;
+            }
+
+            try {
+
+                // UPDATE condicional: mesmo com dois cliques/webhooks,
+                // a entrega só pode ser finalizada uma vez.
+                const resultado =
+                    db.prepare(`
+                        UPDATE compras
+                        SET
+                            entregue = 1,
+                            entregue_em =
+                                CURRENT_TIMESTAMP,
+                            entregue_por = ?
+                        WHERE
+                            order_id = ?
+                            AND entregue = 0
+                    `).run(
+                        interaction.user.id,
+                        orderId
+                    );
+
+                if (
+                    Number(resultado.changes) === 0
+                ) {
+
+                    await interaction.editReply({
+                        content:
+                            "<:danger:1549129849904566392> Este pedido já foi marcado como entregue.",
+                        components: []
+                    });
+
+                    return;
+                }
+
+                const compra =
+                    db.prepare(`
+                        SELECT
+                            order_id,
+                            payment_id,
+                            discord_id,
+                            valor_centavos,
+                            quantidade_robux,
+                            produto,
+                            entregue_em,
+                            entregue_por
+                        FROM compras
+                        WHERE order_id = ?
+                    `).get(orderId);
+
+                const membroCliente =
+                    await interaction.guild.members.fetch(
+                        donoTicket
+                    );
+
+                // Desativa o botão original de entrega.
+                try {
+
+                    const mensagemEntrega =
+                        await interaction.channel.messages.fetch(
+                            mensagemEntregaId
+                        );
+
+                    const componentes =
+                        mensagemEntrega.components.map(
+                            row => {
+
+                                const novaLinha =
+                                    ActionRowBuilder.from(
+                                        row
+                                    );
+
+                                const botoes =
+                                    row.components.map(
+                                        component => {
+
+                                            const botao =
+                                                ButtonBuilder.from(
+                                                    component
+                                                );
+
+                                            if (
+                                                component.customId ===
+                                                "marcar_entregue"
+                                            ) {
+                                                botao
+                                                    .setDisabled(
+                                                        true
+                                                    )
+                                                    .setLabel(
+                                                        "Pedido entregue"
+                                                    );
+                                            }
+
+                                            return botao;
+                                        }
+                                    );
+
+                                novaLinha.setComponents(
+                                    botoes
+                                );
+
+                                return novaLinha;
+                            }
+                        );
+
+                    await mensagemEntrega.edit({
+                        components:
+                            componentes
+                    });
+
+                } catch (buttonError) {
+
+                    console.warn(
+                        "[ENTREGA] Não foi possível desativar o botão de entrega:",
+                        buttonError
+                    );
+                }
+
+                const valorFormatado =
+                    (
+                        Number(
+                            compra?.valor_centavos ||
+                            0
+                        ) / 100
+                    ).toLocaleString(
+                        "pt-BR",
+                        {
+                            style:
+                                "currency",
+                            currency:
+                                "BRL"
+                        }
+                    );
+
+                const quantidadeFormatada =
+                    compra?.quantidade_robux
+                        ? Number(
+                            compra.quantidade_robux
+                        ).toLocaleString(
+                            "pt-BR"
+                        )
+                        : "—";
+
+                const canalAvaliacoesId =
+                    process.env.CANAL_AVALIACOES_ID;
+
+                const textoAvaliacao =
+                    canalAvaliacoesId
+                        ? `<a:greenverification:1548192162653536336> Se puder, conte como foi sua experiência em <#${canalAvaliacoesId}>! Sua avaliação ajuda muito a RZ Store.`
+                        : "<a:greenverification:1548192162653536336> Se puder, deixe uma avaliação da sua experiência com a **RZ Store**!";
+
+                const embedEntregue =
+                    new EmbedBuilder()
+                        .setColor(
+                            "#00db0f"
+                        )
+                        .setTitle(
+                            "<a:greenverification:1548192162653536336> Pedido entregue!"
+                        )
+                        .setDescription(
+                            `${membroCliente}, seu pedido foi marcado como **entregue** pela equipe da RZ Store.\n\n` +
+                            `> <:greenrbx:1548088739677470881> **Quantidade:** ${quantidadeFormatada} Robux\n` +
+                            `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n` +
+                            `> <:sup:1548200025442750505> **Entregue por:** ${interaction.user}\n\n` +
+                            `${textoAvaliacao}\n\n` +
+                            "Obrigado pela preferência! <:greenheart:1548096797992296488>"
+                        )
+                        .setFooter({
+                            text:
+                                "RZ Store • Pedido finalizado"
+                        })
+                        .setTimestamp();
+
+                await interaction.channel.send({
+                    content:
+                        `<@${donoTicket}>`,
+                    embeds: [
+                        embedEntregue
+                    ],
+                    allowedMentions: {
+                        users: [
+                            donoTicket
+                        ],
+                        roles: []
+                    }
+                });
+
+                // =========================================
+                // LOG DA COMPRA ENTREGUE
+                // =========================================
+
+                const canalLogsComprasId =
+                    process.env.CANAL_LOGS_COMPRAS_ID;
+
+                if (canalLogsComprasId) {
+
+                    try {
+
+                        const canalLogs =
+                            await interaction.guild.channels.fetch(
+                                canalLogsComprasId
+                            );
+
+                        if (
+                            canalLogs &&
+                            canalLogs.isTextBased()
+                        ) {
+
+                            const produtoTexto =
+                                compra?.produto ||
+                                (
+                                    compra?.quantidade_robux
+                                        ? `${quantidadeFormatada} Robux`
+                                        : "Compra RZ Store"
+                                );
+
+                            const embedLogCompra =
+                                new EmbedBuilder()
+                                    .setColor(
+                                        "#00db0f"
+                                    )
+                                    .setTitle(
+                                        "<a:greenverification:1548192162653536336> Compra entregue"
+                                    )
+                                    .setDescription(
+                                        `> **Cliente:** ${membroCliente}\n` +
+                                        `> **Discord ID:** \`${donoTicket}\`\n` +
+                                        `> <:greenrbx:1548088739677470881> **Produto:** ${produtoTexto}\n` +
+                                        `> <:greenrbx:1548088739677470881> **Quantidade:** ${quantidadeFormatada} Robux\n` +
+                                        `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n` +
+                                        `> <:sup:1548200025442750505> **Entregue por:** ${interaction.user}\n\n` +
+                                        `> **Order:** \`${compra?.order_id || orderId}\`\n` +
+                                        `> **Pagamento:** \`${compra?.payment_id || "—"}\`\n` +
+                                        `> **Ticket:** ${interaction.channel}`
+                                    )
+                                    .setThumbnail(
+                                        membroCliente.user.displayAvatarURL()
+                                    )
+                                    .setFooter({
+                                        text:
+                                            "RZ Store • Log de compras"
+                                    })
+                                    .setTimestamp();
+
+                            await canalLogs.send({
+                                embeds: [
+                                    embedLogCompra
+                                ],
+                                allowedMentions: {
+                                    users: [],
+                                    roles: []
+                                }
+                            });
+
+                        } else {
+
+                            console.warn(
+                                "[ENTREGA] CANAL_LOGS_COMPRAS_ID não aponta para um canal de texto."
+                            );
+                        }
+
+                    } catch (logError) {
+
+                        console.error(
+                            "[ENTREGA] Erro ao enviar log da compra:",
+                            logError
+                        );
+                    }
+
+                } else {
+
+                    console.warn(
+                        "[ENTREGA] CANAL_LOGS_COMPRAS_ID não configurado no .env."
+                    );
+                }
+
+
+                // =========================================
+                // MENSAGEM PRIVADA PARA O CLIENTE
+                // =========================================
+
+                try {
+
+                    const textoAvaliacaoPrivado =
+                        canalAvaliacoesId
+                            ? `Se puder, deixe sua avaliação em <#${canalAvaliacoesId}>. Sua opinião ajuda muito a RZ Store!`
+                            : "Se puder, deixe uma avaliação da sua experiência com a RZ Store. Sua opinião ajuda muito!";
+
+                    const embedPrivado =
+                        new EmbedBuilder()
+                            .setColor(
+                                "#00db0f"
+                            )
+                            .setTitle(
+                                "<a:greenverification:1548192162653536336> Seu pedido foi entregue!"
+                            )
+                            .setDescription(
+                                `Seu pedido na **RZ Store** foi finalizado com sucesso.\n\n` +
+                                `> <:greenrbx:1548088739677470881> **Quantidade:** ${quantidadeFormatada} Robux\n` +
+                                `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n\n` +
+                                `<a:greenverification:1548192162653536336> ${textoAvaliacaoPrivado}\n\n` +
+                                "Obrigado pela preferência! <:greenheart:1548096797992296488>"
+                            )
+                            .setFooter({
+                                text:
+                                    "RZ Store • Pedido finalizado"
+                            })
+                            .setTimestamp();
+
+                    await membroCliente.send({
+                        embeds: [
+                            embedPrivado
+                        ]
+                    });
+
+                } catch (dmError) {
+
+                    console.warn(
+                        `[ENTREGA] Não foi possível enviar DM para ${donoTicket}. O usuário pode estar com as mensagens privadas desativadas.`,
+                        dmError?.message || dmError
+                    );
+                }
+
+                await interaction.editReply({
+                    content:
+                        "<:okk:1549125132906270851> Pedido marcado como entregue com sucesso.",
+                    components: []
+                });
+
+            } catch (error) {
+
+                console.error(
+                    "[ENTREGA] Erro ao finalizar pedido:",
+                    error
+                );
+
+                await interaction.editReply({
+                    content:
+                        "<:x_:1549124126575165533> Ocorreu um erro ao marcar o pedido como entregue.",
+                    components: []
+                });
+            }
 
             return;
         }
@@ -2904,6 +4390,26 @@ client.on(Events.InteractionCreate, async interaction => {
 
     const valor = (quantidade / 100) * 3.20;
 
+    const estoqueAtual =
+        obterQuantidadeEstoque();
+
+    if (
+        quantidade >
+        estoqueAtual
+    ) {
+
+        await interaction.update({
+            content:
+                `<:danger:1549129849904566392> Estoque insuficiente para esta compra.
+` +
+                `Você selecionou **${formatarRobux(quantidade)} Robux**, mas temos **${formatarRobux(estoqueAtual)} Robux** disponíveis no momento.`,
+            embeds: [],
+            components: []
+        });
+
+        return;
+    }
+
     const quantidadeFormatada =
         quantidade.toLocaleString("pt-BR");
 
@@ -3124,6 +4630,26 @@ if (ticketExistente) {
                     embeds: [],
                     components: []
                 });
+                return;
+            }
+
+            const estoqueAtual =
+                obterQuantidadeEstoque();
+
+            if (
+                produto.robux >
+                estoqueAtual
+            ) {
+
+                await interaction.update({
+                    content:
+                        `<:danger:1549129849904566392> Estoque insuficiente para esta compra.
+` +
+                        `Este pedido precisa de **${formatarRobux(produto.robux)} Robux**, mas temos **${formatarRobux(estoqueAtual)} Robux** disponíveis no momento.`,
+                    embeds: [],
+                    components: []
+                });
+
                 return;
             }
 
