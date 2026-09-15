@@ -2226,6 +2226,93 @@ function formatarRobux(
 }
 
 
+async function enviarLogStaff({
+    guild,
+    staff,
+    titulo,
+    descricao,
+    emoji = "<:sup:1548200025442750505>"
+}) {
+
+    const canalLogsId =
+        process.env
+            .CANAL_LOGS_STAFF_ID ||
+        process.env
+            .CANAL_LOGS_COMPRAS_ID;
+
+    if (!canalLogsId) {
+
+        console.warn(
+            "[STAFF LOG] CANAL_LOGS_STAFF_ID e CANAL_LOGS_COMPRAS_ID não configurados."
+        );
+
+        return false;
+    }
+
+    try {
+
+        const canal =
+            await guild.channels.fetch(
+                canalLogsId
+            );
+
+        if (
+            !canal ||
+            !canal.isTextBased()
+        ) {
+
+            console.warn(
+                "[STAFF LOG] O canal configurado não é um canal de texto válido."
+            );
+
+            return false;
+        }
+
+        const embed =
+            new EmbedBuilder()
+                .setColor(
+                    "#00db0f"
+                )
+                .setTitle(
+                    `${emoji} ${titulo}`
+                )
+                .setDescription(
+                    `${descricao}\n\n` +
+                    `> <:sup:1548200025442750505> **Staff:** ${staff}\n` +
+                    `> **Discord ID:** \`${staff.id}\``
+                )
+                .setThumbnail(
+                    staff.displayAvatarURL()
+                )
+                .setFooter({
+                    text:
+                        "RZ Store • Log da equipe"
+                })
+                .setTimestamp();
+
+        await canal.send({
+            embeds: [
+                embed
+            ],
+            allowedMentions: {
+                parse: []
+            }
+        });
+
+        return true;
+
+    } catch (error) {
+
+        console.error(
+            "[STAFF LOG] Erro ao enviar log:",
+            error
+        );
+
+        return false;
+    }
+}
+
+
 function obterModoManutencao() {
 
     const linha =
@@ -5573,6 +5660,21 @@ client.on(Events.InteractionCreate, async interaction => {
 
             if (resultado.ativo) {
 
+                await enviarLogStaff({
+                    guild:
+                        interaction.guild,
+                    staff:
+                        interaction.user,
+                    titulo:
+                        "Modo manutenção ativado",
+                    emoji:
+                        "<:cadeado:1549128145381367949>",
+                    descricao:
+                        `> **Estado:** Ativado
+` +
+                        `> **Motivo:** ${resultado.motivo}`
+                });
+
                 await interaction.reply({
                     content:
                         "<:cadeado:1549128145381367949> **Modo manutenção ativado.**\n\n" +
@@ -5587,6 +5689,20 @@ client.on(Events.InteractionCreate, async interaction => {
                 );
 
             } else {
+
+                await enviarLogStaff({
+                    guild:
+                        interaction.guild,
+                    staff:
+                        interaction.user,
+                    titulo:
+                        "Modo manutenção desativado",
+                    emoji:
+                        "<a:greenverification:1548192162653536336>",
+                    descricao:
+                        "> **Estado:** Desativado\n" +
+                        "> **Vendas:** Liberadas novamente"
+                });
 
                 await interaction.reply({
                     content:
@@ -5835,6 +5951,25 @@ client.on(Events.InteractionCreate, async interaction => {
                     1000
                 );
 
+            await enviarLogStaff({
+                guild:
+                    interaction.guild,
+                staff:
+                    interaction.user,
+                titulo:
+                    "Cupom criado",
+                emoji:
+                    "<:cupom:1548097312046186559>",
+                descricao:
+                    `> <:cupom:1548097312046186559> **Código:** \`${codigo}\`\n` +
+                    `> **Desconto:** ${desconto}% OFF\n` +
+                    `> <:ampulheta:1549129208557469786> **Validade:** <t:${validadeUnix}:F>\n` +
+                    `> <:danger:1549129849904566392> **Limite total:** ${limiteUsos === 0 ? "Ilimitado" : `${limiteUsos} usos`}\n` +
+                    `> <:cliente:1548196941102317568> **Por pessoa:** ${limitePorPessoa === 0 ? "Ilimitado" : `${limitePorPessoa} uso(s)`}\n` +
+                    `> <:greencart:1548089836647485591> **Máximo do pedido:** ${maximoRobux === 0 ? "Sem limite" : `${formatarRobux(maximoRobux)} Robux`}\n` +
+                    `> <:esmeralda:1548188465508909118> **Somente boosters:** ${somenteBoosters ? "Sim" : "Não"}`
+            });
+
             await interaction.reply({
                 content:
                     `<:okk:1549125132906270851> Cupom \`${codigo}\` criado com **${desconto}% OFF**.\n` +
@@ -5909,6 +6044,20 @@ client.on(Events.InteractionCreate, async interaction => {
             await atualizarPainelCupons(
                 interaction.guild
             );
+
+            await enviarLogStaff({
+                guild:
+                    interaction.guild,
+                staff:
+                    interaction.user,
+                titulo:
+                    "Cupom desativado",
+                emoji:
+                    "<:cupom:1548097312046186559>",
+                descricao:
+                    `> <:cupom:1548097312046186559> **Código:** \`${codigo}\`\n` +
+                    "> **Estado:** Desativado"
+            });
 
             await interaction.reply({
                 content:
@@ -6161,6 +6310,21 @@ client.on(Events.InteractionCreate, async interaction => {
                     interaction.guild
                 );
 
+                await enviarLogStaff({
+                    guild:
+                        interaction.guild,
+                    staff:
+                        interaction.user,
+                    titulo:
+                        "Estoque definido manualmente",
+                    emoji:
+                        "<:greenrbx:1548088739677470881>",
+                    descricao:
+                        `> <:greenrbx:1548088739677470881> **Antes:** ${formatarRobux(resultado.estoqueAntes)} Robux\n` +
+                        `> <a:greenverification:1548192162653536336> **Depois:** ${formatarRobux(resultado.estoqueDepois)} Robux\n` +
+                        `> **Diferença:** ${resultado.estoqueDepois - resultado.estoqueAntes >= 0 ? "+" : ""}${formatarRobux(resultado.estoqueDepois - resultado.estoqueAntes)} Robux`
+                });
+
                 await interaction.reply({
                     content:
                         `<:okk:1549125132906270851> Estoque alterado de **${formatarRobux(resultado.estoqueAntes)}** para **${formatarRobux(resultado.estoqueDepois)} Robux**.`,
@@ -6217,6 +6381,24 @@ client.on(Events.InteractionCreate, async interaction => {
                 tipo === "entrada"
                     ? "adicionados"
                     : "removidos";
+
+            await enviarLogStaff({
+                guild:
+                    interaction.guild,
+                staff:
+                    interaction.user,
+                titulo:
+                    tipo === "entrada"
+                        ? "Robux adicionados ao estoque"
+                        : "Robux removidos do estoque",
+                emoji:
+                    "<:greenrbx:1548088739677470881>",
+                descricao:
+                    `> **Ação:** ${tipo === "entrada" ? "Entrada manual" : "Saída manual"}\n` +
+                    `> <:greenrbx:1548088739677470881> **Quantidade:** ${formatarRobux(quantidade)} Robux\n` +
+                    `> **Estoque anterior:** ${formatarRobux(resultado.estoqueAntes)} Robux\n` +
+                    `> <a:greenverification:1548192162653536336> **Estoque atual:** ${formatarRobux(resultado.estoqueDepois)} Robux`
+            });
 
             await interaction.reply({
                 content:
@@ -8547,6 +8729,23 @@ client.on(Events.InteractionCreate, async interaction => {
                     }
                 });
 
+                await enviarLogStaff({
+                    guild:
+                        interaction.guild,
+                    staff:
+                        interaction.user,
+                    titulo:
+                        "Pedido marcado como entregue",
+                    emoji:
+                        "<a:greenverification:1548192162653536336>",
+                    descricao:
+                        `> <:cliente:1548196941102317568> **Cliente:** <@${donoTicket}>\n` +
+                        `> <:greenrbx:1548088739677470881> **Quantidade:** ${quantidadeFormatada} Robux\n` +
+                        `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n` +
+                        `> **Order:** \`${compra?.order_id || orderId}\`\n` +
+                        `> **Ticket:** \`${interaction.channel.name}\` (\`${interaction.channel.id}\`)`
+                });
+
                 // =========================================
                 // LOG DA COMPRA ENTREGUE
                 // =========================================
@@ -9948,6 +10147,19 @@ if (ticketExistente) {
                 return;
             }
 
+            const donoTicket =
+                interaction.channel.topic
+                    ?.match(
+                        /rzstore-user:(\d+)/
+                    )?.[1];
+
+            const orderId =
+                interaction.channel.topic
+                    ?.match(
+                        /mp-order:([^|]+)/
+                    )?.[1]
+                    ?.trim();
+
             const pedidoFoiEncerrado =
                 encerrarPedidoEmAberto(
                     interaction.channel.id,
@@ -9966,6 +10178,22 @@ if (ticketExistente) {
                     interaction.guild
                 );
             }
+
+            await enviarLogStaff({
+                guild:
+                    interaction.guild,
+                staff:
+                    interaction.user,
+                titulo:
+                    "Ticket fechado",
+                emoji:
+                    "<:cadeado:1549128145381367949>",
+                descricao:
+                    `> <:cliente:1548196941102317568> **Cliente:** ${donoTicket ? `<@${donoTicket}>` : "Não identificado"}\n` +
+                    `> **Ticket:** \`${interaction.channel.name}\` (\`${interaction.channel.id}\`)\n` +
+                    `> **Order:** ${orderId ? `\`${orderId}\`` : "Nenhuma"}\n` +
+                    `> <:ampulheta:1549129208557469786> **Pedido em aberto cancelado:** ${pedidoFoiEncerrado ? "Sim" : "Não"}`
+            });
 
             await interaction.update({
                 content:
