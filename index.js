@@ -103,6 +103,34 @@ db.exec(`
         staff_discord_id TEXT,
         criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS cupons (
+        codigo TEXT PRIMARY KEY,
+        desconto_percentual INTEGER NOT NULL,
+        validade_em TEXT NOT NULL,
+        limite_usos INTEGER NOT NULL DEFAULT 0,
+        usos INTEGER NOT NULL DEFAULT 0,
+        ativo INTEGER NOT NULL DEFAULT 1,
+        criado_por TEXT,
+        criado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS cupom_usos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        codigo TEXT NOT NULL,
+        discord_id TEXT NOT NULL,
+        order_id TEXT NOT NULL UNIQUE,
+        desconto_centavos INTEGER NOT NULL DEFAULT 0,
+        usado_em TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cupom_usos_codigo
+    ON cupom_usos(codigo);
+
+    CREATE TABLE IF NOT EXISTS configuracoes (
+        chave TEXT PRIMARY KEY,
+        valor TEXT
+    );
 `);
 
 // Migra bancos antigos sem apagar nenhum dado.
@@ -148,6 +176,85 @@ if (
     db.exec(`
         ALTER TABLE compras
         ADD COLUMN entregue_por TEXT
+    `);
+}
+
+if (
+    !nomesColunasCompras.has(
+        "valor_original_centavos"
+    )
+) {
+    db.exec(`
+        ALTER TABLE compras
+        ADD COLUMN valor_original_centavos INTEGER
+    `);
+}
+
+if (
+    !nomesColunasCompras.has(
+        "desconto_centavos"
+    )
+) {
+    db.exec(`
+        ALTER TABLE compras
+        ADD COLUMN desconto_centavos INTEGER NOT NULL DEFAULT 0
+    `);
+}
+
+if (
+    !nomesColunasCompras.has(
+        "cupom_codigo"
+    )
+) {
+    db.exec(`
+        ALTER TABLE compras
+        ADD COLUMN cupom_codigo TEXT
+    `);
+}
+
+// Migra a tabela de cupons sem apagar os cupons já existentes.
+const colunasCupons =
+    db.prepare(
+        "PRAGMA table_info(cupons)"
+    ).all();
+
+const nomesColunasCupons =
+    new Set(
+        colunasCupons.map(
+            coluna => coluna.name
+        )
+    );
+
+if (
+    !nomesColunasCupons.has(
+        "limite_por_pessoa"
+    )
+) {
+    db.exec(`
+        ALTER TABLE cupons
+        ADD COLUMN limite_por_pessoa INTEGER NOT NULL DEFAULT 0
+    `);
+}
+
+if (
+    !nomesColunasCupons.has(
+        "maximo_robux"
+    )
+) {
+    db.exec(`
+        ALTER TABLE cupons
+        ADD COLUMN maximo_robux INTEGER NOT NULL DEFAULT 0
+    `);
+}
+
+if (
+    !nomesColunasCupons.has(
+        "somente_boosters"
+    )
+) {
+    db.exec(`
+        ALTER TABLE cupons
+        ADD COLUMN somente_boosters INTEGER NOT NULL DEFAULT 0
     `);
 }
 
@@ -393,6 +500,501 @@ function validarAssinaturaMercadoPago({
     return false;
 }
 
+
+
+function normalizarCodigoCupom(
+    codigo
+) {
+
+    return String(
+        codigo || ""
+    )
+        .trim()
+        .toUpperCase();
+}
+
+
+function obterCupom(
+    codigo
+) {
+
+    const codigoNormalizado =
+        normalizarCodigoCupom(
+            codigo
+        );
+
+    if (!codigoNormalizado) {
+        return null;
+    }
+
+    return db.prepare(`
+        SELECT
+            codigo,
+            desconto_percentual,
+            validade_em,
+            limite_usos,
+            usos,
+            limite_por_pessoa,
+            maximo_robux,
+            somente_boosters,
+            ativo,
+            criado_por,
+            criado_em
+        FROM cupons
+        WHERE codigo = ?
+    `).get(
+        codigoNormalizado
+    ) || null;
+}
+
+
+function validarCupom(
+    codigo,
+    {
+        discordId = null,
+        quantidadeRobux = null,
+        isBooster = false
+    } = {}
+) {
+
+    const cupom =
+        obterCupom(
+            codigo
+        );
+
+    if (!cupom) {
+        return {
+            valido: false,
+            motivo:
+                "Cupom não encontrado."
+        };
+    }
+
+    if (
+        Number(cupom.ativo) !== 1
+    ) {
+        return {
+            valido: false,
+            motivo:
+                "Este cupom não está mais ativo."
+        };
+    }
+
+    const validade =
+        new Date(
+            cupom.validade_em
+        );
+
+    if (
+        Number.isNaN(
+            validade.getTime()
+        ) ||
+        validade.getTime() <
+        Date.now()
+    ) {
+        return {
+            valido: false,
+            motivo:
+                "Este cupom já expirou."
+        };
+    }
+
+    const limite =
+        Number(
+            cupom.limite_usos || 0
+        );
+
+    const usos =
+        Number(
+            cupom.usos || 0
+        );
+
+    if (
+        limite > 0 &&
+        usos >= limite
+    ) {
+        return {
+            valido: false,
+            motivo:
+                "Este cupom atingiu o limite total de usos."
+        };
+    }
+
+    const limitePorPessoa =
+        Number(
+            cupom.limite_por_pessoa || 0
+        );
+
+    if (
+        limitePorPessoa > 0 &&
+        discordId
+    ) {
+
+        const usosDaPessoa =
+            Number(
+                db.prepare(`
+                    SELECT COUNT(*) AS total
+                    FROM cupom_usos
+                    WHERE
+                        codigo = ?
+                        AND discord_id = ?
+                `).get(
+                    cupom.codigo,
+                    discordId
+                )?.total || 0
+            );
+
+        if (
+            usosDaPessoa >=
+            limitePorPessoa
+        ) {
+            return {
+                valido: false,
+                motivo:
+                    limitePorPessoa === 1
+                        ? "Você já utilizou este cupom anteriormente."
+                        : `Você já atingiu o limite de ${limitePorPessoa} usos deste cupom por pessoa.`
+            };
+        }
+    }
+
+    const maximoRobux =
+        Number(
+            cupom.maximo_robux || 0
+        );
+
+    if (
+        maximoRobux > 0 &&
+        Number.isFinite(
+            Number(
+                quantidadeRobux
+            )
+        ) &&
+        Number(
+            quantidadeRobux
+        ) >
+        maximoRobux
+    ) {
+        return {
+            valido: false,
+            motivo:
+                `Este cupom só pode ser usado em pedidos de até ${formatarRobux(maximoRobux)} Robux.`
+        };
+    }
+
+    if (
+        Number(
+            cupom.somente_boosters || 0
+        ) === 1 &&
+        !isBooster
+    ) {
+        return {
+            valido: false,
+            motivo:
+                "Este cupom é exclusivo para boosters do servidor."
+        };
+    }
+
+    return {
+        valido: true,
+        cupom
+    };
+}
+
+function calcularDescontoCupom(
+    valorOriginalCentavos,
+    cupom
+) {
+
+    const descontoPercentual =
+        Number(
+            cupom.desconto_percentual
+        );
+
+    const descontoCentavos =
+        Math.round(
+            valorOriginalCentavos *
+            descontoPercentual /
+            100
+        );
+
+    const valorFinalCentavos =
+        Math.max(
+            1,
+            valorOriginalCentavos -
+            descontoCentavos
+        );
+
+    return {
+        descontoPercentual,
+        descontoCentavos,
+        valorFinalCentavos
+    };
+}
+
+
+function listarCuponsAtivos() {
+
+    return db.prepare(`
+        SELECT
+            codigo,
+            desconto_percentual,
+            validade_em,
+            limite_usos,
+            usos,
+            limite_por_pessoa,
+            maximo_robux,
+            somente_boosters
+        FROM cupons
+        WHERE
+            ativo = 1
+            AND validade_em > ?
+            AND (
+                limite_usos = 0
+                OR usos < limite_usos
+            )
+        ORDER BY
+            desconto_percentual DESC,
+            validade_em ASC
+    `).all(
+        new Date().toISOString()
+    );
+}
+
+
+function formatarListaCupons(
+    cupons
+) {
+
+    if (
+        !cupons ||
+        cupons.length === 0
+    ) {
+        return (
+            "<:interrogacoes:1548096277856649296> " +
+            "**Nenhum cupom ativo no momento.**\n\n" +
+            "Fique de olho neste canal para não perder os próximos descontos!"
+        );
+    }
+
+    return cupons
+        .map(cupom => {
+
+            const validadeUnix =
+                Math.floor(
+                    new Date(
+                        cupom.validade_em
+                    ).getTime() /
+                    1000
+                );
+
+            const limite =
+                Number(
+                    cupom.limite_usos || 0
+                );
+
+            const usos =
+                Number(
+                    cupom.usos || 0
+                );
+
+            const usosTexto =
+                limite === 0
+                    ? "<:danger:1549129849904566392> Usos totais ilimitados"
+                    : `<:danger:1549129849904566392> ${Math.max(
+                        0,
+                        limite - usos
+                    )} uso(s) total(is) restante(s)`;
+
+            const regras = [
+                usosTexto
+            ];
+
+            const limitePorPessoa =
+                Number(
+                    cupom.limite_por_pessoa || 0
+                );
+
+            if (
+                limitePorPessoa > 0
+            ) {
+                regras.push(
+                    limitePorPessoa === 1
+                        ? "<:cliente:1548196941102317568> 1 uso por pessoa"
+                        : `<:cliente:1548196941102317568> Até ${limitePorPessoa} usos por pessoa`
+                );
+            }
+
+            const maximoRobux =
+                Number(
+                    cupom.maximo_robux || 0
+                );
+
+            if (
+                maximoRobux > 0
+            ) {
+                regras.push(
+                    `<:greencart:1548089836647485591> Pedidos de até ${formatarRobux(maximoRobux)} Robux`
+                );
+            }
+
+            if (
+                Number(
+                    cupom.somente_boosters || 0
+                ) === 1
+            ) {
+                regras.push(
+                    "<:esmeralda:1548188465508909118> Exclusivo para boosters"
+                );
+            }
+
+            return (
+                `### <:cupom:1548097312046186559> \`${cupom.codigo}\` — ${cupom.desconto_percentual}% OFF\n` +
+                `> <:ampulheta:1549129208557469786> Válido até <t:${validadeUnix}:D>\n` +
+                regras
+                    .map(
+                        regra =>
+                            `> ${regra}`
+                    )
+                    .join(
+                        "\n"
+                    )
+            );
+        })
+        .join(
+            "\n\n"
+        );
+}
+
+
+async function atualizarPainelCupons(
+    guild
+) {
+
+    const canalId =
+        process.env.CANAL_CUPONS_ID;
+
+    if (!canalId) {
+        return;
+    }
+
+    try {
+
+        const canal =
+            await guild.channels.fetch(
+                canalId
+            );
+
+        if (
+            !canal ||
+            !canal.isTextBased()
+        ) {
+            console.warn(
+                "[CUPONS] CANAL_CUPONS_ID não aponta para um canal de texto."
+            );
+            return;
+        }
+
+        const embed =
+            new EmbedBuilder()
+                .setColor(
+                    "#00db0f"
+                )
+                .setTitle(
+                    "<a:greengifts:1548099596075409499> Cupons de desconto disponíveis"
+                )
+                .setDescription(
+                    "<a:greensparkles:1548099963051843695> Aproveite os cupons ativos abaixo e economize nas suas compras de Robux.\n\n" +
+                    formatarListaCupons(
+                        listarCuponsAtivos()
+                    ) +
+                    "\n\n> Use o código do cupom durante sua compra."
+                )
+                .setFooter({
+                    text:
+                        "RZ Store • Cupons"
+                })
+                .setTimestamp();
+
+        const banner =
+            process.env.CUPONS_BANNER_URL
+                ?.trim();
+
+        if (
+            banner &&
+            /^https?:\/\//i.test(
+                banner
+            )
+        ) {
+            embed.setImage(
+                banner
+            );
+        }
+
+        const config =
+            db.prepare(`
+                SELECT valor
+                FROM configuracoes
+                WHERE chave =
+                    'painel_cupons_message_id'
+            `).get();
+
+        let mensagem = null;
+
+        if (config?.valor) {
+            try {
+                mensagem =
+                    await canal.messages.fetch(
+                        config.valor
+                    );
+            } catch {
+                mensagem = null;
+            }
+        }
+
+        if (mensagem) {
+
+            await mensagem.edit({
+                embeds: [
+                    embed
+                ]
+            });
+
+        } else {
+
+            const novaMensagem =
+                await canal.send({
+                    embeds: [
+                        embed
+                    ]
+                });
+
+            db.prepare(`
+                INSERT INTO configuracoes (
+                    chave,
+                    valor
+                )
+                VALUES (
+                    'painel_cupons_message_id',
+                    ?
+                )
+                ON CONFLICT(chave)
+                DO UPDATE SET
+                    valor =
+                        excluded.valor
+            `).run(
+                novaMensagem.id
+            );
+        }
+
+    } catch (error) {
+
+        console.error(
+            "[CUPONS] Erro ao atualizar painel:",
+            error
+        );
+    }
+}
 
 
 function obterQuantidadeEstoque() {
@@ -696,7 +1298,10 @@ function registrarCompraAprovada({
     discordId,
     valorCentavos,
     quantidadeRobux,
-    produto
+    produto,
+    valorOriginalCentavos = null,
+    descontoCentavos = 0,
+    cupomCodigo = null
 }) {
 
     const quantidade =
@@ -714,6 +1319,38 @@ function registrarCompraAprovada({
             "Não foi possível identificar a quantidade de Robux para baixar do estoque."
         );
     }
+
+    const valorOriginal =
+        Number.isInteger(
+            Number(
+                valorOriginalCentavos
+            )
+        )
+            ? Number(
+                valorOriginalCentavos
+            )
+            : valorCentavos;
+
+    const desconto =
+        Number.isInteger(
+            Number(
+                descontoCentavos
+            )
+        )
+            ? Math.max(
+                0,
+                Number(
+                    descontoCentavos
+                )
+            )
+            : 0;
+
+    const codigoCupom =
+        cupomCodigo
+            ? normalizarCodigoCupom(
+                cupomCodigo
+            )
+            : null;
 
     db.exec(
         "BEGIN IMMEDIATE"
@@ -819,18 +1456,58 @@ function registrarCompraAprovada({
                 payment_id,
                 discord_id,
                 valor_centavos,
+                valor_original_centavos,
+                desconto_centavos,
+                cupom_codigo,
                 quantidade_robux,
                 produto
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
             orderId,
             paymentId || null,
             discordId,
             valorCentavos,
+            valorOriginal,
+            desconto,
+            codigoCupom,
             quantidade,
             produto || null
         );
+
+        if (codigoCupom) {
+
+            const uso =
+                db.prepare(`
+                    INSERT OR IGNORE INTO cupom_usos (
+                        codigo,
+                        discord_id,
+                        order_id,
+                        desconto_centavos
+                    )
+                    VALUES (?, ?, ?, ?)
+                `).run(
+                    codigoCupom,
+                    discordId,
+                    orderId,
+                    desconto
+                );
+
+            if (
+                Number(
+                    uso.changes
+                ) > 0
+            ) {
+                db.prepare(`
+                    UPDATE cupons
+                    SET usos =
+                        usos + 1
+                    WHERE codigo = ?
+                `).run(
+                    codigoCupom
+                );
+            }
+        }
 
         db.prepare(`
             INSERT INTO clientes (
@@ -1424,6 +2101,30 @@ async function processarOrderAprovada(orderId) {
                     )?.[1]
             );
 
+        const cupomCodigo =
+            ticket.topic
+                ?.match(
+                    /cupom:([^|]+)/
+                )?.[1]
+                ?.trim() ||
+            null;
+
+        const valorOriginalCentavos =
+            Number(
+                ticket.topic
+                    ?.match(
+                        /valor-original-centavos:(\d+)/
+                    )?.[1]
+            );
+
+        const descontoCentavos =
+            Number(
+                ticket.topic
+                    ?.match(
+                        /desconto-centavos:(\d+)/
+                    )?.[1]
+            );
+
         const produto =
             ticket.topic
                 ?.match(
@@ -1465,7 +2166,20 @@ async function processarOrderAprovada(orderId) {
                     )
                         ? quantidadeRobux
                         : null,
-                produto
+                produto,
+                valorOriginalCentavos:
+                    Number.isInteger(
+                        valorOriginalCentavos
+                    )
+                        ? valorOriginalCentavos
+                        : valorCentavosPedido,
+                descontoCentavos:
+                    Number.isInteger(
+                        descontoCentavos
+                    )
+                        ? descontoCentavos
+                        : 0,
+                cupomCodigo
             });
 
         if (registro.semEstoque) {
@@ -1545,6 +2259,12 @@ async function processarOrderAprovada(orderId) {
             registro.estoqueDepois
         );
 
+        if (cupomCodigo) {
+            await atualizarPainelCupons(
+                guild
+            );
+        }
+
         let cargoAtual = null;
 
         try {
@@ -1611,6 +2331,11 @@ async function processarOrderAprovada(orderId) {
                     `> **Order:** \`${orderId}\`\n` +
                     `> **Pagamento:** \`${paymentId}\`\n` +
                     `> **Valor do pedido:** ${valorPedidoFormatado}\n` +
+                    (
+                        cupomCodigo
+                            ? `> <:cupom:1548097312046186559> **Cupom:** \`${cupomCodigo}\`\n`
+                            : ""
+                    ) +
                     (
                         MERCADO_PAGO_TEST_MODE
                             ? `> **Cobrança sandbox:** ${valorPagoFormatado}\n`
@@ -1890,7 +2615,81 @@ client.once("clientReady", async () => {
 
         new SlashCommandBuilder()
             .setName("anunciarestoque")
-            .setDescription("Publica o estoque atual no canal público")
+            .setDescription("Publica o estoque atual no canal público"),
+
+        new SlashCommandBuilder()
+            .setName("criarcupom")
+            .setDescription("Cria um novo cupom de desconto")
+            .addStringOption(option =>
+                option
+                    .setName("codigo")
+                    .setDescription("Código do cupom, ex: RZ10")
+                    .setRequired(true)
+                    .setMinLength(2)
+                    .setMaxLength(20)
+            )
+            .addIntegerOption(option =>
+                option
+                    .setName("desconto")
+                    .setDescription("Desconto percentual do cupom")
+                    .setRequired(true)
+                    .setMinValue(1)
+                    .setMaxValue(90)
+            )
+            .addIntegerOption(option =>
+                option
+                    .setName("validade_dias")
+                    .setDescription("Por quantos dias o cupom ficará válido")
+                    .setRequired(true)
+                    .setMinValue(1)
+                    .setMaxValue(365)
+            )
+            .addIntegerOption(option =>
+                option
+                    .setName("usos")
+                    .setDescription("Limite total de usos (0 = ilimitado)")
+                    .setRequired(true)
+                    .setMinValue(0)
+                    .setMaxValue(100000)
+            )
+            .addIntegerOption(option =>
+                option
+                    .setName("por_pessoa")
+                    .setDescription("Limite de usos por pessoa (0 = ilimitado)")
+                    .setRequired(false)
+                    .setMinValue(0)
+                    .setMaxValue(1000)
+            )
+            .addIntegerOption(option =>
+                option
+                    .setName("maximo_robux")
+                    .setDescription("Maior pedido permitido em Robux (0 = sem limite)")
+                    .setRequired(false)
+                    .setMinValue(0)
+                    .setMaxValue(10000000)
+            )
+            .addBooleanOption(option =>
+                option
+                    .setName("somente_boosters")
+                    .setDescription("Permitir o cupom somente para boosters")
+                    .setRequired(false)
+            ),
+
+        new SlashCommandBuilder()
+            .setName("removercupom")
+            .setDescription("Desativa um cupom de desconto")
+            .addStringOption(option =>
+                option
+                    .setName("codigo")
+                    .setDescription("Código do cupom")
+                    .setRequired(true)
+                    .setMinLength(2)
+                    .setMaxLength(20)
+            ),
+
+        new SlashCommandBuilder()
+            .setName("cupons")
+            .setDescription("Mostra os cupons ativos da RZ Store")
     ].map(command => command.toJSON());
 
     const rest = new REST({ version: "10" })
@@ -1908,12 +2707,40 @@ client.once("clientReady", async () => {
             }
         );
 
-        console.log("Comandos /setupcomprar, /korblox, /cliente, /estoque, /adicionarestoque, /removerestoque, /setarestoque e /anunciarestoque registrados no servidor.");
+        console.log("Comandos da RZ Store registrados, incluindo estoque e cupons.");
 
     } catch (error) {
 
         console.error(error);
 
+    }
+
+    try {
+
+        const guildCupons =
+            await client.guilds.fetch(
+                process.env.GUILD_ID
+            );
+
+        await atualizarPainelCupons(
+            guildCupons
+        );
+
+        setInterval(
+            async () => {
+                await atualizarPainelCupons(
+                    guildCupons
+                );
+            },
+            10 * 60 * 1000
+        );
+
+    } catch (error) {
+
+        console.error(
+            "[CUPONS] Não foi possível iniciar o painel automático:",
+            error
+        );
     }
 
     app.listen(PORT, () => {
@@ -2095,6 +2922,286 @@ async function enviarPixNoTicket(interaction, dados, valorCentavos) {
 
 
 client.on(Events.InteractionCreate, async interaction => {
+
+    // =========================================
+    // COMANDOS DE CUPOM
+    // =========================================
+
+    if (
+        interaction.isChatInputCommand() &&
+        [
+            "criarcupom",
+            "removercupom",
+            "cupons"
+        ].includes(
+            interaction.commandName
+        )
+    ) {
+
+        if (
+            !interaction.member.roles.cache.has(
+                process.env.STAFF_ROLE_ID
+            )
+        ) {
+
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode usar este comando.",
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        if (
+            interaction.commandName ===
+            "cupons"
+        ) {
+
+            const embed =
+                new EmbedBuilder()
+                    .setColor(
+                        "#00db0f"
+                    )
+                    .setTitle(
+                        "<:cupom:1548097312046186559> Cupons ativos"
+                    )
+                    .setDescription(
+                        formatarListaCupons(
+                            listarCuponsAtivos()
+                        )
+                    )
+                    .setFooter({
+                        text:
+                            "RZ Store • Gerenciamento de cupons"
+                    })
+                    .setTimestamp();
+
+            await interaction.reply({
+                embeds: [
+                    embed
+                ],
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        if (
+            interaction.commandName ===
+            "criarcupom"
+        ) {
+
+            const codigo =
+                normalizarCodigoCupom(
+                    interaction.options.getString(
+                        "codigo",
+                        true
+                    )
+                );
+
+            const desconto =
+                interaction.options.getInteger(
+                    "desconto",
+                    true
+                );
+
+            const validadeDias =
+                interaction.options.getInteger(
+                    "validade_dias",
+                    true
+                );
+
+            const limiteUsos =
+                interaction.options.getInteger(
+                    "usos",
+                    true
+                );
+
+            const limitePorPessoa =
+                interaction.options.getInteger(
+                    "por_pessoa",
+                    false
+                ) ?? 0;
+
+            const maximoRobux =
+                interaction.options.getInteger(
+                    "maximo_robux",
+                    false
+                ) ?? 0;
+
+            const somenteBoosters =
+                interaction.options.getBoolean(
+                    "somente_boosters",
+                    false
+                ) ?? false;
+
+            if (
+                !/^[A-Z0-9_-]{2,20}$/.test(
+                    codigo
+                )
+            ) {
+
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> O código pode conter apenas letras, números, `_` e `-`.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            if (
+                obterCupom(
+                    codigo
+                )
+            ) {
+
+                await interaction.reply({
+                    content:
+                        `<:danger:1549129849904566392> Já existe um cupom com o código \`${codigo}\`.`,
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            const validade =
+                new Date(
+                    Date.now() +
+                    validadeDias *
+                    24 *
+                    60 *
+                    60 *
+                    1000
+                );
+
+            db.prepare(`
+                INSERT INTO cupons (
+                    codigo,
+                    desconto_percentual,
+                    validade_em,
+                    limite_usos,
+                    usos,
+                    limite_por_pessoa,
+                    maximo_robux,
+                    somente_boosters,
+                    ativo,
+                    criado_por
+                )
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, 1, ?)
+            `).run(
+                codigo,
+                desconto,
+                validade.toISOString(),
+                limiteUsos,
+                limitePorPessoa,
+                maximoRobux,
+                somenteBoosters
+                    ? 1
+                    : 0,
+                interaction.user.id
+            );
+
+            await atualizarPainelCupons(
+                interaction.guild
+            );
+
+            const validadeUnix =
+                Math.floor(
+                    validade.getTime() /
+                    1000
+                );
+
+            await interaction.reply({
+                content:
+                    `<:okk:1549125132906270851> Cupom \`${codigo}\` criado com **${desconto}% OFF**.\n` +
+                    `<:ampulheta:1549129208557469786> Validade: <t:${validadeUnix}:F>\n` +
+                    (
+                        limiteUsos === 0
+                            ? "<:danger:1549129849904566392> Usos totais ilimitados.\n"
+                            : `<:danger:1549129849904566392> Limite total: **${limiteUsos} usos**.\n`
+                    ) +
+                    (
+                        limitePorPessoa === 0
+                            ? "<:cliente:1548196941102317568> Sem limite por pessoa.\n"
+                            : `<:cliente:1548196941102317568> Limite por pessoa: **${limitePorPessoa} uso(s)**.\n`
+                    ) +
+                    (
+                        maximoRobux === 0
+                            ? "<:greencart:1548089836647485591> Sem limite máximo de Robux por pedido.\n"
+                            : `<:greencart:1548089836647485591> Pedido máximo: **${formatarRobux(maximoRobux)} Robux**.\n`
+                    ) +
+                    (
+                        somenteBoosters
+                            ? "<:esmeralda:1548188465508909118> **Exclusivo para boosters.**"
+                            : "<:esmeralda:1548188465508909118> Disponível para todos os clientes."
+                    ),
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        if (
+            interaction.commandName ===
+            "removercupom"
+        ) {
+
+            const codigo =
+                normalizarCodigoCupom(
+                    interaction.options.getString(
+                        "codigo",
+                        true
+                    )
+                );
+
+            const resultado =
+                db.prepare(`
+                    UPDATE cupons
+                    SET ativo = 0
+                    WHERE
+                        codigo = ?
+                        AND ativo = 1
+                `).run(
+                    codigo
+                );
+
+            if (
+                Number(
+                    resultado.changes
+                ) === 0
+            ) {
+
+                await interaction.reply({
+                    content:
+                        `<:interrogacoes:1548096277856649296> Não encontrei um cupom ativo com o código \`${codigo}\`.`,
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            await atualizarPainelCupons(
+                interaction.guild
+            );
+
+            await interaction.reply({
+                content:
+                    `<:okk:1549125132906270851> Cupom \`${codigo}\` desativado com sucesso.`,
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+    }
 
     // =========================================
     // COMANDOS DE ESTOQUE
@@ -3159,6 +4266,15 @@ client.on(Events.InteractionCreate, async interaction => {
                     .setStyle(ButtonStyle.Success),
 
                 new ButtonBuilder()
+                    .setCustomId(`usar_cupom_robux_${quantidade}`)
+                    .setLabel("Usar cupom")
+                    .setEmoji({
+                        id: "1548097312046186559",
+                        name: "cupom"
+                    })
+                    .setStyle(ButtonStyle.Secondary),
+
+                new ButtonBuilder()
                     .setCustomId("cancelar_compra")
                     .setLabel("Cancelar")
                     .setEmoji({
@@ -3249,6 +4365,15 @@ client.on(Events.InteractionCreate, async interaction => {
                     .setStyle(ButtonStyle.Success),
 
                 new ButtonBuilder()
+                    .setCustomId(`usar_cupom_item_${opcao}`)
+                    .setLabel("Usar cupom")
+                    .setEmoji({
+                        id: "1548097312046186559",
+                        name: "cupom"
+                    })
+                    .setStyle(ButtonStyle.Secondary),
+
+                new ButtonBuilder()
                     .setCustomId("cancelar_compra")
                     .setLabel("Cancelar")
                     .setEmoji({
@@ -3333,6 +4458,15 @@ client.on(Events.InteractionCreate, async interaction => {
                         name: "okk"
                     })
                     .setStyle(ButtonStyle.Success),
+
+                new ButtonBuilder()
+                    .setCustomId(`usar_cupom_robux_${quantidade}`)
+                    .setLabel("Usar cupom")
+                    .setEmoji({
+                        id: "1548097312046186559",
+                        name: "cupom"
+                    })
+                    .setStyle(ButtonStyle.Secondary),
 
                 new ButtonBuilder()
                     .setCustomId("cancelar_compra")
@@ -3725,6 +4859,319 @@ client.on(Events.InteractionCreate, async interaction => {
 
 
     // =========================================
+    // MODAL DO CUPOM
+    // =========================================
+
+    if (
+        interaction.isModalSubmit() &&
+        interaction.customId.startsWith(
+            "modal_cupom_"
+        )
+    ) {
+
+        const dados =
+            interaction.customId.replace(
+                "modal_cupom_",
+                ""
+            );
+
+        const separador =
+            dados.indexOf(
+                "_"
+            );
+
+        const tipoCompra =
+            dados.slice(
+                0,
+                separador
+            );
+
+        const referencia =
+            dados.slice(
+                separador + 1
+            );
+
+        const codigo =
+            normalizarCodigoCupom(
+                interaction.fields.getTextInputValue(
+                    "codigo_cupom"
+                )
+            );
+
+        const quantidadeParaValidar =
+            tipoCompra === "robux"
+                ? Number(
+                    referencia
+                )
+                : (
+                    referencia === "korblox"
+                        ? 17000
+                        : (
+                            referencia === "headless"
+                                ? 31000
+                                : 0
+                        )
+                );
+
+        const ehBooster =
+            Boolean(
+                interaction.member
+                    ?.premiumSinceTimestamp ||
+                interaction.member
+                    ?.premiumSince
+            );
+
+        const validacao =
+            validarCupom(
+                codigo,
+                {
+                    discordId:
+                        interaction.user.id,
+                    quantidadeRobux:
+                        quantidadeParaValidar,
+                    isBooster:
+                        ehBooster
+                }
+            );
+
+        if (
+            !validacao.valido
+        ) {
+
+            await interaction.reply({
+                content:
+                    `<:x_:1549124126575165533> ${validacao.motivo}`,
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        let valorOriginalCentavos;
+        let titulo;
+        let detalhes;
+        let customIdConfirmar;
+
+        if (
+            tipoCompra ===
+            "robux"
+        ) {
+
+            const quantidade =
+                Number(
+                    referencia
+                );
+
+            if (
+                !Number.isInteger(
+                    quantidade
+                ) ||
+                quantidade < 100
+            ) {
+
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Quantidade de Robux inválida.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            valorOriginalCentavos =
+                Math.round(
+                    (
+                        quantidade /
+                        100
+                    ) *
+                    320
+                );
+
+            titulo =
+                "<:greenrbx:1548088739677470881> Cupom aplicado";
+
+            detalhes =
+                `> **Quantidade:** ${formatarRobux(quantidade)} Robux`;
+
+            customIdConfirmar =
+                `confirmar_compra_cupom_${quantidade}_${codigo}`;
+
+        } else {
+
+            const produtos = {
+                korblox: {
+                    nome:
+                        "Korblox",
+                    robux:
+                        17000,
+                    valorCentavos:
+                        54400
+                },
+                headless: {
+                    nome:
+                        "Headless",
+                    robux:
+                        31000,
+                    valorCentavos:
+                        99200
+                }
+            };
+
+            const produto =
+                produtos[
+                    referencia
+                ];
+
+            if (!produto) {
+
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Produto inválido.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            valorOriginalCentavos =
+                produto.valorCentavos;
+
+            titulo =
+                `<:greencart:1548089836647485591> Cupom aplicado — ${produto.nome}`;
+
+            detalhes =
+                `> **Produto:** ${produto.nome}\n` +
+                `> <:greenrbx:1548088739677470881> **Preço em Robux:** ${formatarRobux(produto.robux)}`;
+
+            customIdConfirmar =
+                `confirmar_item_cupom_${referencia}_${codigo}`;
+        }
+
+        const calculo =
+            calcularDescontoCupom(
+                valorOriginalCentavos,
+                validacao.cupom
+            );
+
+        const originalFormatado =
+            (
+                valorOriginalCentavos /
+                100
+            ).toLocaleString(
+                "pt-BR",
+                {
+                    style:
+                        "currency",
+                    currency:
+                        "BRL"
+                }
+            );
+
+        const descontoFormatado =
+            (
+                calculo.descontoCentavos /
+                100
+            ).toLocaleString(
+                "pt-BR",
+                {
+                    style:
+                        "currency",
+                    currency:
+                        "BRL"
+                }
+            );
+
+        const finalFormatado =
+            (
+                calculo.valorFinalCentavos /
+                100
+            ).toLocaleString(
+                "pt-BR",
+                {
+                    style:
+                        "currency",
+                    currency:
+                        "BRL"
+                }
+            );
+
+        const embed =
+            new EmbedBuilder()
+                .setColor(
+                    "#00db0f"
+                )
+                .setTitle(
+                    titulo
+                )
+                .setDescription(
+                    `${detalhes}\n\n` +
+                    `> <:cupom:1548097312046186559> **Cupom:** \`${codigo}\`\n` +
+                    `> **Desconto:** ${validacao.cupom.desconto_percentual}% OFF\n` +
+                    `> **Valor original:** ~~${originalFormatado}~~\n` +
+                    `> **Economia:** ${descontoFormatado}\n` +
+                    `> <:pix:1548090281402966107> **Valor final:** **${finalFormatado}**`
+                )
+                .setFooter({
+                    text:
+                        "RZ Store • Cupom aplicado"
+                });
+
+        const row =
+            new ActionRowBuilder()
+                .addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(
+                            customIdConfirmar
+                        )
+                        .setLabel(
+                            "Confirmar compra"
+                        )
+                        .setEmoji({
+                            id:
+                                "1549125132906270851",
+                            name:
+                                "okk"
+                        })
+                        .setStyle(
+                            ButtonStyle.Success
+                        ),
+
+                    new ButtonBuilder()
+                        .setCustomId(
+                            "cancelar_compra"
+                        )
+                        .setLabel(
+                            "Cancelar"
+                        )
+                        .setEmoji({
+                            id:
+                                "1549124126575165533",
+                            name:
+                                "x_"
+                        })
+                        .setStyle(
+                            ButtonStyle.Danger
+                        )
+                );
+
+        await interaction.reply({
+            embeds: [
+                embed
+            ],
+            components: [
+                row
+            ],
+            flags:
+                MessageFlags.Ephemeral
+        });
+
+        return;
+    }
+
+    // =========================================
     // BOTÕES
     // =========================================
 
@@ -3788,6 +5235,106 @@ client.on(Events.InteractionCreate, async interaction => {
 
             await interaction.showModal(
                 modalRoblox
+            );
+
+            return;
+        }
+
+
+        // =========================================
+        // USAR CUPOM
+        // =========================================
+
+        if (
+            interaction.customId.startsWith(
+                "usar_cupom_"
+            )
+        ) {
+
+            const dados =
+                interaction.customId.replace(
+                    "usar_cupom_",
+                    ""
+                );
+
+            const separador =
+                dados.indexOf(
+                    "_"
+                );
+
+            const tipoCompra =
+                dados.slice(
+                    0,
+                    separador
+                );
+
+            const referencia =
+                dados.slice(
+                    separador + 1
+                );
+
+            if (
+                ![
+                    "robux",
+                    "item"
+                ].includes(
+                    tipoCompra
+                ) ||
+                !referencia
+            ) {
+
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Não consegui identificar esta compra.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            const modal =
+                new ModalBuilder()
+                    .setCustomId(
+                        `modal_cupom_${tipoCompra}_${referencia}`
+                    )
+                    .setTitle(
+                        "Aplicar cupom"
+                    );
+
+            const input =
+                new TextInputBuilder()
+                    .setCustomId(
+                        "codigo_cupom"
+                    )
+                    .setLabel(
+                        "Código do cupom"
+                    )
+                    .setPlaceholder(
+                        "Exemplo: RZ10"
+                    )
+                    .setStyle(
+                        TextInputStyle.Short
+                    )
+                    .setRequired(
+                        true
+                    )
+                    .setMinLength(
+                        2
+                    )
+                    .setMaxLength(
+                        20
+                    );
+
+            modal.addComponents(
+                new ActionRowBuilder()
+                    .addComponents(
+                        input
+                    )
+            );
+
+            await interaction.showModal(
+                modal
             );
 
             return;
@@ -4059,6 +5606,9 @@ client.on(Events.InteractionCreate, async interaction => {
                             payment_id,
                             discord_id,
                             valor_centavos,
+                            valor_original_centavos,
+                            desconto_centavos,
+                            cupom_codigo,
                             quantidade_robux,
                             produto,
                             entregue_em,
@@ -4248,6 +5798,11 @@ client.on(Events.InteractionCreate, async interaction => {
                                         `> <:greenrbx:1548088739677470881> **Produto:** ${produtoTexto}\n` +
                                         `> <:greenrbx:1548088739677470881> **Quantidade:** ${quantidadeFormatada} Robux\n` +
                                         `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n` +
+                                        (
+                                            compra?.cupom_codigo
+                                                ? `> <:cupom:1548097312046186559> **Cupom:** \`${compra.cupom_codigo}\`\n`
+                                                : ""
+                                        ) +
                                         `> <:sup:1548200025442750505> **Entregue por:** ${interaction.user}\n\n` +
                                         `> **Order:** \`${compra?.order_id || orderId}\`\n` +
                                         `> **Pagamento:** \`${compra?.payment_id || "—"}\`\n` +
@@ -4617,14 +6172,124 @@ client.on(Events.InteractionCreate, async interaction => {
     )
 ) {
 
-    const quantidade = Number(
+    const dadosCompra =
         interaction.customId.replace(
             "confirmar_compra_",
             ""
-        )
-    );
+        );
 
-    const valor = (quantidade / 100) * 3.20;
+    let quantidade;
+    let cupomCodigo = null;
+
+    if (
+        dadosCompra.startsWith(
+            "cupom_"
+        )
+    ) {
+
+        const match =
+            dadosCompra.match(
+                /^cupom_(\d+)_(.+)$/
+            );
+
+        if (!match) {
+
+            await interaction.update({
+                content:
+                    "<:x_:1549124126575165533> Não consegui identificar os dados deste cupom.",
+                embeds: [],
+                components: []
+            });
+
+            return;
+        }
+
+        quantidade =
+            Number(
+                match[1]
+            );
+
+        cupomCodigo =
+            normalizarCodigoCupom(
+                match[2]
+            );
+
+    } else {
+
+        quantidade =
+            Number(
+                dadosCompra
+            );
+    }
+
+    const valorOriginalCentavos =
+        Math.round(
+            (
+                quantidade /
+                100
+            ) *
+            320
+        );
+
+    let valorCentavos =
+        valorOriginalCentavos;
+
+    let descontoCentavos = 0;
+    let descontoPercentual = 0;
+
+    if (cupomCodigo) {
+
+        const validacao =
+            validarCupom(
+                cupomCodigo,
+                {
+                    discordId:
+                        interaction.user.id,
+                    quantidadeRobux:
+                        quantidade,
+                    isBooster:
+                        Boolean(
+                            interaction.member
+                                ?.premiumSinceTimestamp ||
+                            interaction.member
+                                ?.premiumSince
+                        )
+                }
+            );
+
+        if (
+            !validacao.valido
+        ) {
+
+            await interaction.update({
+                content:
+                    `<:x_:1549124126575165533> ${validacao.motivo}`,
+                embeds: [],
+                components: []
+            });
+
+            return;
+        }
+
+        const calculo =
+            calcularDescontoCupom(
+                valorOriginalCentavos,
+                validacao.cupom
+            );
+
+        valorCentavos =
+            calculo.valorFinalCentavos;
+
+        descontoCentavos =
+            calculo.descontoCentavos;
+
+        descontoPercentual =
+            calculo.descontoPercentual;
+    }
+
+    const valor =
+        valorCentavos /
+        100;
 
     const estoqueAtual =
         obterQuantidadeEstoque();
@@ -4703,7 +6368,14 @@ if (ticketExistente) {
 
             parent: process.env.CATEGORY_TICKETS_ID,
 
-            topic: `RZ Store | rzstore-user:${interaction.user.id} | Compra de ${interaction.user.tag} | robux:${quantidade} | valor-centavos:${Math.round(valor * 100)}`,
+            topic:
+                `RZ Store | rzstore-user:${interaction.user.id} | Compra de ${interaction.user.tag} | robux:${quantidade} | ` +
+                `valor-original-centavos:${valorOriginalCentavos} | desconto-centavos:${descontoCentavos} | valor-centavos:${valorCentavos}` +
+                (
+                    cupomCodigo
+                        ? ` | cupom:${cupomCodigo}`
+                        : ""
+                ),
 
             permissionOverwrites: [
 
@@ -4753,6 +6425,12 @@ if (ticketExistente) {
                 `### <:greenrbx:1548088739677470881> Detalhes do pedido\n` +
                 `> **Cliente:** ${interaction.user}\n` +
                 `> **Quantidade:** ${quantidadeFormatada} Robux\n` +
+                (
+                    cupomCodigo
+                        ? `> <:cupom:1548097312046186559> **Cupom:** \`${cupomCodigo}\` — ${descontoPercentual}% OFF\n` +
+                          `> **Desconto:** ${(descontoCentavos / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}\n`
+                        : ""
+                ) +
                 `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n\n` +
 
                 `### <:ampulheta:1549129208557469786> Status\n` +
@@ -4764,8 +6442,6 @@ if (ticketExistente) {
                 text: "RZ Store"
             })
             .setTimestamp();
-
-        const valorCentavos = Math.round(valor * 100);
 
         const botoesTicket = new ActionRowBuilder()
             .addComponents(
@@ -4840,10 +6516,49 @@ if (ticketExistente) {
             )
         ) {
 
-            const opcao = interaction.customId.replace(
-                "confirmar_item_",
-                ""
-            );
+            const dadosItem =
+                interaction.customId.replace(
+                    "confirmar_item_",
+                    ""
+                );
+
+            let opcao =
+                dadosItem;
+
+            let cupomCodigo =
+                null;
+
+            if (
+                dadosItem.startsWith(
+                    "cupom_"
+                )
+            ) {
+
+                const match =
+                    dadosItem.match(
+                        /^cupom_([^_]+)_(.+)$/
+                    );
+
+                if (!match) {
+
+                    await interaction.update({
+                        content:
+                            "<:x_:1549124126575165533> Não consegui identificar os dados deste cupom.",
+                        embeds: [],
+                        components: []
+                    });
+
+                    return;
+                }
+
+                opcao =
+                    match[1];
+
+                cupomCodigo =
+                    normalizarCodigoCupom(
+                        match[2]
+                    );
+            }
 
             const produtos = {
                 korblox: {
@@ -4867,6 +6582,68 @@ if (ticketExistente) {
                     components: []
                 });
                 return;
+            }
+
+            const valorOriginalCentavos =
+                Math.round(
+                    produto.valor *
+                    100
+                );
+
+            let valorCentavosItem =
+                valorOriginalCentavos;
+
+            let descontoCentavos = 0;
+            let descontoPercentual = 0;
+
+            if (cupomCodigo) {
+
+                const validacao =
+                    validarCupom(
+                        cupomCodigo,
+                        {
+                            discordId:
+                                interaction.user.id,
+                            quantidadeRobux:
+                                produto.robux,
+                            isBooster:
+                                Boolean(
+                                    interaction.member
+                                        ?.premiumSinceTimestamp ||
+                                    interaction.member
+                                        ?.premiumSince
+                                )
+                        }
+                    );
+
+                if (
+                    !validacao.valido
+                ) {
+
+                    await interaction.update({
+                        content:
+                            `<:x_:1549124126575165533> ${validacao.motivo}`,
+                        embeds: [],
+                        components: []
+                    });
+
+                    return;
+                }
+
+                const calculo =
+                    calcularDescontoCupom(
+                        valorOriginalCentavos,
+                        validacao.cupom
+                    );
+
+                valorCentavosItem =
+                    calculo.valorFinalCentavos;
+
+                descontoCentavos =
+                    calculo.descontoCentavos;
+
+                descontoPercentual =
+                    calculo.descontoPercentual;
             }
 
             const estoqueAtual =
@@ -4928,10 +6705,19 @@ if (ticketExistente) {
                 .slice(0, 15);
 
             const robuxFormatado = produto.robux.toLocaleString("pt-BR");
-            const valorFormatado = produto.valor.toLocaleString("pt-BR", {
-                style: "currency",
-                currency: "BRL"
-            });
+            const valorFormatado =
+                (
+                    valorCentavosItem /
+                    100
+                ).toLocaleString(
+                    "pt-BR",
+                    {
+                        style:
+                            "currency",
+                        currency:
+                            "BRL"
+                    }
+                );
 
             try {
 
@@ -4943,7 +6729,14 @@ if (ticketExistente) {
 
                     parent: process.env.CATEGORY_TICKETS_ID,
 
-                    topic: `RZ Store | rzstore-user:${interaction.user.id} | Produto: ${produto.nome} | Compra de ${interaction.user.tag} | robux:${produto.robux} | valor-centavos:${Math.round(produto.valor * 100)}`,
+                    topic:
+                        `RZ Store | rzstore-user:${interaction.user.id} | Produto: ${produto.nome} | Compra de ${interaction.user.tag} | robux:${produto.robux} | ` +
+                        `valor-original-centavos:${valorOriginalCentavos} | desconto-centavos:${descontoCentavos} | valor-centavos:${valorCentavosItem}` +
+                        (
+                            cupomCodigo
+                                ? ` | cupom:${cupomCodigo}`
+                                : ""
+                        ),
 
                     permissionOverwrites: [
 
@@ -4989,6 +6782,12 @@ if (ticketExistente) {
                         `> **Cliente:** ${interaction.user}\n` +
                         `> **Produto:** ${produto.nome}\n` +
                         `> <:greenrbx:1548088739677470881> **Preço em Robux:** ${robuxFormatado}\n` +
+                        (
+                            cupomCodigo
+                                ? `> <:cupom:1548097312046186559> **Cupom:** \`${cupomCodigo}\` — ${descontoPercentual}% OFF\n` +
+                                  `> **Desconto:** ${(descontoCentavos / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}\n`
+                                : ""
+                        ) +
                         `> <:pix:1548090281402966107> **Valor:** ${valorFormatado}\n\n` +
 
                         `### <:ampulheta:1549129208557469786> Status\n` +
@@ -5000,8 +6799,6 @@ if (ticketExistente) {
                         text: "RZ Store"
                     })
                     .setTimestamp();
-
-                const valorCentavosItem = Math.round(produto.valor * 100);
 
                 const botoesTicketItem = new ActionRowBuilder()
                     .addComponents(
