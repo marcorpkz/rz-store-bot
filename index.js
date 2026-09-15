@@ -525,6 +525,79 @@ function alterarEstoqueManual({
 }
 
 
+function setarEstoqueManual({
+    quantidade,
+    staffDiscordId
+}) {
+
+    if (
+        !Number.isInteger(quantidade) ||
+        quantidade < 0
+    ) {
+        throw new Error(
+            "A quantidade do estoque deve ser um número inteiro igual ou maior que zero."
+        );
+    }
+
+    db.exec(
+        "BEGIN IMMEDIATE"
+    );
+
+    try {
+
+        const estoqueAntes =
+            obterQuantidadeEstoque();
+
+        const diferenca =
+            quantidade -
+            estoqueAntes;
+
+        db.prepare(`
+            UPDATE estoque
+            SET
+                quantidade = ?,
+                atualizado_em = CURRENT_TIMESTAMP
+            WHERE id = 1
+        `).run(
+            quantidade
+        );
+
+        db.prepare(`
+            INSERT INTO estoque_movimentos (
+                tipo,
+                quantidade,
+                saldo_apos,
+                staff_discord_id
+            )
+            VALUES (?, ?, ?, ?)
+        `).run(
+            "set_manual",
+            diferenca,
+            quantidade,
+            staffDiscordId || null
+        );
+
+        db.exec(
+            "COMMIT"
+        );
+
+        return {
+            estoqueAntes,
+            estoqueDepois:
+                quantidade
+        };
+
+    } catch (error) {
+
+        db.exec(
+            "ROLLBACK"
+        );
+
+        throw error;
+    }
+}
+
+
 async function notificarEstoqueBaixo(
     guild,
     estoqueAntes,
@@ -1802,7 +1875,22 @@ client.once("clientReady", async () => {
                     .setDescription("Quantidade de Robux que será removida")
                     .setRequired(true)
                     .setMinValue(1)
-            )
+            ),
+
+        new SlashCommandBuilder()
+            .setName("setarestoque")
+            .setDescription("Define o estoque para uma quantidade exata")
+            .addIntegerOption(option =>
+                option
+                    .setName("quantidade")
+                    .setDescription("Nova quantidade total de Robux em estoque")
+                    .setRequired(true)
+                    .setMinValue(0)
+            ),
+
+        new SlashCommandBuilder()
+            .setName("anunciarestoque")
+            .setDescription("Publica o estoque atual no canal público")
     ].map(command => command.toJSON());
 
     const rest = new REST({ version: "10" })
@@ -1820,7 +1908,7 @@ client.once("clientReady", async () => {
             }
         );
 
-        console.log("Comandos /setupcomprar, /korblox, /cliente, /estoque, /adicionarestoque e /removerestoque registrados no servidor.");
+        console.log("Comandos /setupcomprar, /korblox, /cliente, /estoque, /adicionarestoque, /removerestoque, /setarestoque e /anunciarestoque registrados no servidor.");
 
     } catch (error) {
 
@@ -2017,7 +2105,9 @@ client.on(Events.InteractionCreate, async interaction => {
         [
             "estoque",
             "adicionarestoque",
-            "removerestoque"
+            "removerestoque",
+            "setarestoque",
+            "anunciarestoque"
         ].includes(
             interaction.commandName
         )
@@ -2077,11 +2167,157 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
+        if (
+            interaction.commandName ===
+            "anunciarestoque"
+        ) {
+
+            const canalPublicoId =
+                process.env.CANAL_ESTOQUE_PUBLICO_ID;
+
+            if (!canalPublicoId) {
+
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Configure `CANAL_ESTOQUE_PUBLICO_ID` no `.env` primeiro.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            try {
+
+                const canalPublico =
+                    await interaction.guild.channels.fetch(
+                        canalPublicoId
+                    );
+
+                if (
+                    !canalPublico ||
+                    !canalPublico.isTextBased()
+                ) {
+                    throw new Error(
+                        "O canal configurado não é um canal de texto válido."
+                    );
+                }
+
+                const estoqueAtual =
+                    obterQuantidadeEstoque();
+
+                const caminhoBanner =
+                    path.join(
+                        __dirname,
+                        "assets",
+                        "estoque",
+                        "estoque.png"
+                    );
+
+                const embedPublico =
+                    new EmbedBuilder()
+                        .setColor(
+                            "#00db0f"
+                        )
+                        .setTitle(
+                            "<:greenrbx:1548088739677470881> Estoque da semana"
+                        )
+                        .setDescription(
+                            "Confira o estoque de Robux disponível para esta semana na **RZ Store**.\n\n" +
+                            `> <:greenrbx:1548088739677470881> **Estoque da semana:** ${formatarRobux(estoqueAtual)} Robux\n\n` +
+                            "Garanta seu pedido enquanto ainda temos Robux disponíveis. O estoque pode diminuir ao longo da semana conforme novas compras são realizadas."
+                        )
+                        .setImage(
+                            "attachment://estoque.png"
+                        )
+                        .setFooter({
+                            text:
+                                "RZ Store • Estoque semanal"
+                        })
+                        .setTimestamp();
+
+                await canalPublico.send({
+                    embeds: [
+                        embedPublico
+                    ],
+                    files: [
+                        {
+                            attachment:
+                                caminhoBanner,
+                            name:
+                                "estoque.png"
+                        }
+                    ],
+                    allowedMentions: {
+                        users: [],
+                        roles: []
+                    }
+                });
+
+                await interaction.reply({
+                    content:
+                        `<:okk:1549125132906270851> Estoque anunciado com sucesso em ${canalPublico}.`,
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+            } catch (error) {
+
+                console.error(
+                    "[ESTOQUE] Erro ao anunciar estoque:",
+                    error
+                );
+
+                await interaction.reply({
+                    content:
+                        `<:x_:1549124126575165533> Não consegui anunciar o estoque: ${error.message}`,
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+            }
+
+            return;
+        }
+
         const quantidade =
             interaction.options.getInteger(
                 "quantidade",
                 true
             );
+
+        if (
+            interaction.commandName ===
+            "setarestoque"
+        ) {
+
+            try {
+
+                const resultado =
+                    setarEstoqueManual({
+                        quantidade,
+                        staffDiscordId:
+                            interaction.user.id
+                    });
+
+                await interaction.reply({
+                    content:
+                        `<:okk:1549125132906270851> Estoque alterado de **${formatarRobux(resultado.estoqueAntes)}** para **${formatarRobux(resultado.estoqueDepois)} Robux**.`,
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+            } catch (error) {
+
+                await interaction.reply({
+                    content:
+                        `<:x_:1549124126575165533> ${error.message}`,
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+            }
+
+            return;
+        }
 
         try {
 
