@@ -410,12 +410,25 @@ async function processarOrderAprovada(orderId) {
                 })
                 .setTimestamp();
 
+        const botaoRoblox = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId("enviar_nick_roblox")
+                    .setLabel("Enviar nick do Roblox")
+                    .setEmoji({
+                        id: "1548176792010104923",
+                        name: "roblox"
+                    })
+                    .setStyle(ButtonStyle.Success)
+            );
+
         await ticket.send({
             content:
                 donoTicket
-                    ? `<@${donoTicket}>`
+                    ? `<@${donoTicket}> agora envie seu **nome de usuário ou ID do Roblox** para realizarmos a entrega.`
                     : undefined,
-            embeds: [embedPagamento]
+            embeds: [embedPagamento],
+            components: [botaoRoblox]
         });
 
         const topicoAtual =
@@ -576,6 +589,10 @@ const client = new Client({
         GatewayIntentBits.Guilds
     ]
 });
+
+// Evita envio duplicado do nick do Roblox no mesmo ticket.
+// O botão também será desativado no Discord após o primeiro envio.
+const robloxNickEnviado = new Set();
 
 client.once("clientReady", async () => {
 
@@ -1602,11 +1619,275 @@ client.on(Events.InteractionCreate, async interaction => {
     }
 
 
+
+    // =========================================
+    // MODAL DO NICK / ID DO ROBLOX
+    // =========================================
+
+    if (
+        interaction.isModalSubmit() &&
+        interaction.customId.startsWith("modal_nick_roblox_")
+    ) {
+
+        const mensagemBotaoId =
+            interaction.customId.replace(
+                "modal_nick_roblox_",
+                ""
+            );
+
+        const donoTicket = interaction.channel.topic
+            ?.match(/rzstore-user:(\d+)/)?.[1];
+
+        if (
+            !donoTicket ||
+            interaction.user.id !== donoTicket
+        ) {
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Apenas o cliente deste ticket pode enviar os dados do Roblox.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+        if (
+            robloxNickEnviado.has(
+                interaction.channel.id
+            )
+        ) {
+            await interaction.reply({
+                content:
+                    "<:danger:1549129849904566392> Você já enviou os dados do Roblox neste ticket.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        const nickRoblox = interaction.fields
+            .getTextInputValue("nick_roblox")
+            .trim();
+
+        const quantidadeRobux = Number(
+            interaction.channel.topic
+                ?.match(/robux:(\d+)/)?.[1]
+        );
+
+        const valorCentavos = Number(
+            interaction.channel.topic
+                ?.match(/valor-centavos:(\d+)/)?.[1]
+        );
+
+        const quantidadeRobuxFormatada =
+            Number.isFinite(quantidadeRobux)
+                ? quantidadeRobux.toLocaleString("pt-BR")
+                : "Não identificado";
+
+        const valorPagamentoFormatado =
+            Number.isFinite(valorCentavos)
+                ? (valorCentavos / 100).toLocaleString(
+                    "pt-BR",
+                    {
+                        style: "currency",
+                        currency: "BRL"
+                    }
+                )
+                : "Não identificado";
+
+        if (
+            nickRoblox.length < 1 ||
+            nickRoblox.length > 50
+        ) {
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Digite um nome de usuário ou ID do Roblox válido.",
+                flags: MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        // Responde imediatamente ao modal para ele fechar sem ficar
+        // no estado "RZ Store está pensando...".
+        await interaction.reply({
+            content:
+                "<:okk:1549125132906270851> Dados recebidos! Aguarde a equipe realizar a entrega.",
+            flags: MessageFlags.Ephemeral
+        });
+
+        // Marca imediatamente para impedir qualquer segundo envio.
+        robloxNickEnviado.add(
+            interaction.channel.id
+        );
+
+        try {
+
+            const embedRoblox = new EmbedBuilder()
+                .setColor("#00db0f")
+                .setTitle(
+                    "<:roblox:1548176792010104923> Dados para entrega"
+                )
+                .setDescription(
+                    `> **Cliente:** ${interaction.user}\n` +
+                    `> **Roblox:** \`${nickRoblox}\`\n` +
+                    `> <:greenrbx:1548088739677470881> **Quantidade:** ${quantidadeRobuxFormatada} Robux\n` +
+                    `> <:pix:1548090281402966107> **Valor pago:** ${valorPagamentoFormatado}\n\n` +
+                    "<:okk:1549125132906270851> Os dados foram enviados para a equipe. Agora é só aguardar a entrega."
+                )
+                .setFooter({
+                    text: "RZ Store"
+                })
+                .setTimestamp();
+
+            // Primeiro envia o embed. Assim, mesmo que a alteração
+            // do tópico falhe, os dados da entrega não são perdidos.
+            await interaction.channel.send({
+                content: `<@&${process.env.STAFF_ROLE_ID}>`,
+                embeds: [embedRoblox],
+                allowedMentions: {
+                    roles: [process.env.STAFF_ROLE_ID]
+                }
+            });
+
+            // Desativa o botão da mensagem EXATA que abriu o modal.
+            try {
+
+                const mensagemComBotao =
+                    await interaction.channel.messages.fetch(
+                        mensagemBotaoId
+                    );
+
+                const componentesDesativados =
+                    mensagemComBotao.components.map(row => {
+
+                        const novaLinha =
+                            ActionRowBuilder.from(row);
+
+                        const novosBotoes =
+                            row.components.map(component => {
+
+                                const botao =
+                                    ButtonBuilder.from(component);
+
+                                if (
+                                    component.customId ===
+                                    "enviar_nick_roblox"
+                                ) {
+                                    botao.setDisabled(true);
+                                }
+
+                                return botao;
+                            });
+
+                        novaLinha.setComponents(
+                            novosBotoes
+                        );
+
+                        return novaLinha;
+                    });
+
+                await mensagemComBotao.edit({
+                    components:
+                        componentesDesativados
+                });
+
+            } catch (buttonError) {
+
+                console.warn(
+                    "Não foi possível desativar o botão do Roblox:",
+                    buttonError
+                );
+
+            }
+
+        } catch (error) {
+
+            console.error(
+                "Erro ao enviar embed dos dados do Roblox:",
+                error
+            );
+
+            await interaction.followUp({
+                content:
+                    "<:x_:1549124126575165533> Houve um erro ao registrar os dados no ticket. Avise a equipe.",
+                flags: MessageFlags.Ephemeral
+            });
+
+        }
+
+        return;
+    }
+
+
     // =========================================
     // BOTÕES
     // =========================================
 
     if (interaction.isButton()) {
+
+        // =========================================
+        // ENVIAR NICK / ID DO ROBLOX
+        // =========================================
+
+        if (
+            interaction.customId === "enviar_nick_roblox"
+        ) {
+
+            if (
+                robloxNickEnviado.has(
+                    interaction.channel.id
+                )
+            ) {
+                await interaction.reply({
+                    content:
+                        "<:danger:1549129849904566392> Você já enviou os dados do Roblox neste ticket.",
+                    flags: MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            const donoTicket = interaction.channel.topic
+                ?.match(/rzstore-user:(\d+)/)?.[1];
+
+            if (
+                !donoTicket ||
+                interaction.user.id !== donoTicket
+            ) {
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Apenas o cliente deste ticket pode enviar os dados do Roblox.",
+                    flags: MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+            const modalRoblox = new ModalBuilder()
+                .setCustomId(
+                    `modal_nick_roblox_${interaction.message.id}`
+                )
+                .setTitle("Dados do Roblox");
+
+            const nickInput = new TextInputBuilder()
+                .setCustomId("nick_roblox")
+                .setLabel("Nome de usuário ou ID do Roblox")
+                .setPlaceholder("Exemplo: @bananinhagamer123 ou 123456789")
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true)
+                .setMaxLength(50);
+
+            modalRoblox.addComponents(
+                new ActionRowBuilder()
+                    .addComponents(nickInput)
+            );
+
+            await interaction.showModal(
+                modalRoblox
+            );
+
+            return;
+        }
+
 
         // =========================================
         // COPIAR PIX
@@ -1926,7 +2207,7 @@ if (ticketExistente) {
 
             parent: process.env.CATEGORY_TICKETS_ID,
 
-            topic: `RZ Store | rzstore-user:${interaction.user.id} | Compra de ${interaction.user.tag}`,
+            topic: `RZ Store | rzstore-user:${interaction.user.id} | Compra de ${interaction.user.tag} | robux:${quantidade} | valor-centavos:${Math.round(valor * 100)}`,
 
             permissionOverwrites: [
 
@@ -2146,7 +2427,7 @@ if (ticketExistente) {
 
                     parent: process.env.CATEGORY_TICKETS_ID,
 
-                    topic: `RZ Store | rzstore-user:${interaction.user.id} | Produto: ${produto.nome} | Compra de ${interaction.user.tag}`,
+                    topic: `RZ Store | rzstore-user:${interaction.user.id} | Produto: ${produto.nome} | Compra de ${interaction.user.tag} | robux:${produto.robux} | valor-centavos:${Math.round(produto.valor * 100)}`,
 
                     permissionOverwrites: [
 
