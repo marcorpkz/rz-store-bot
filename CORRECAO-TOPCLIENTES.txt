@@ -1,0 +1,11 @@
+CORREÇÃO /topclientes
+
+O Discord exige custom_id diferente para cada botão da mesma mensagem.
+Quando havia apenas uma página (inclusive 0 clientes), as duas setas
+apontavam para a página 0 e recebiam o mesmo custom_id, fazendo a API
+rejeitar a resposta e aparecer "O aplicativo não respondeu".
+
+Agora:
+- seta esquerda e direita possuem IDs diferentes;
+- funciona com 0 clientes, 1 página ou várias páginas;
+- erros futuros são registrados no console e recebem resposta no Discord.

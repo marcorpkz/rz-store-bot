@@ -3072,7 +3072,7 @@ function montarTopClientes(
     const botaoEsquerda =
         new ButtonBuilder()
             .setCustomId(
-                `topclientes_pagina_${Math.max(0, dados.pagina - 1)}`
+                `topclientes_pagina_esquerda_${Math.max(0, dados.pagina - 1)}`
             )
             .setEmoji(
                 "⬅️"
@@ -3087,7 +3087,7 @@ function montarTopClientes(
     const botaoDireita =
         new ButtonBuilder()
             .setCustomId(
-                `topclientes_pagina_${Math.min(dados.totalPaginas - 1, dados.pagina + 1)}`
+                `topclientes_pagina_direita_${Math.min(dados.totalPaginas - 1, dados.pagina + 1)}`
             )
             .setEmoji(
                 "➡️"
@@ -9105,21 +9105,44 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
-        const painel =
-            montarTopClientes(
-                0
+        try {
+
+            const painel =
+                montarTopClientes(
+                    0
+                );
+
+            await interaction.reply({
+                embeds: [
+                    painel.embed
+                ],
+                components:
+                    painel.components,
+                allowedMentions: {
+                    parse: []
+                }
+            });
+
+        } catch (error) {
+
+            console.error(
+                "[TOP CLIENTES] Erro ao montar ranking:",
+                error
             );
 
-        await interaction.reply({
-            embeds: [
-                painel.embed
-            ],
-            components:
-                painel.components,
-            allowedMentions: {
-                parse: []
+            if (
+                !interaction.replied &&
+                !interaction.deferred
+            ) {
+
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Não foi possível carregar o ranking de clientes.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
             }
-        });
+        }
 
         return;
     }
@@ -11034,7 +11057,10 @@ client.on(Events.InteractionCreate, async interaction => {
 
         if (
             interaction.customId.startsWith(
-                "topclientes_pagina_"
+                "topclientes_pagina_esquerda_"
+            ) ||
+            interaction.customId.startsWith(
+                "topclientes_pagina_direita_"
             )
         ) {
 
@@ -11056,10 +11082,9 @@ client.on(Events.InteractionCreate, async interaction => {
 
             const pagina =
                 Number(
-                    interaction.customId.replace(
-                        "topclientes_pagina_",
-                        ""
-                    )
+                    interaction.customId
+                        .split("_")
+                        .at(-1)
                 );
 
             const painel =
