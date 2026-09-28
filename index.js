@@ -2825,6 +2825,298 @@ async function processarPedidosExpirados(
 }
 
 
+function obterTotalClientesRanking() {
+
+    const linha =
+        db.prepare(`
+            SELECT COUNT(*) AS total
+            FROM clientes
+            WHERE total_centavos > 0
+        `).get();
+
+    return Number(
+        linha?.total ||
+        0
+    );
+}
+
+
+function obterPosicaoClienteRanking(
+    discordId
+) {
+
+    const linha =
+        db.prepare(`
+            SELECT
+                posicao,
+                total
+            FROM (
+                SELECT
+                    discord_id,
+                    ROW_NUMBER() OVER (
+                        ORDER BY
+                            total_centavos DESC,
+                            compras DESC,
+                            atualizado_em ASC,
+                            discord_id ASC
+                    ) AS posicao,
+                    COUNT(*) OVER () AS total
+                FROM clientes
+                WHERE total_centavos > 0
+            )
+            WHERE discord_id = ?
+        `).get(
+            discordId
+        );
+
+    if (!linha) {
+        return null;
+    }
+
+    return {
+        posicao:
+            Number(
+                linha.posicao
+            ),
+        total:
+            Number(
+                linha.total
+            )
+    };
+}
+
+
+function obterPaginaTopClientes(
+    pagina = 0,
+    porPagina = 10
+) {
+
+    const paginaSegura =
+        Math.max(
+            0,
+            Number(
+                pagina
+            ) || 0
+        );
+
+    const limite =
+        Math.max(
+            1,
+            Number(
+                porPagina
+            ) || 10
+        );
+
+    const totalClientes =
+        obterTotalClientesRanking();
+
+    const totalPaginas =
+        Math.max(
+            1,
+            Math.ceil(
+                totalClientes /
+                limite
+            )
+        );
+
+    const paginaFinal =
+        Math.min(
+            paginaSegura,
+            totalPaginas - 1
+        );
+
+    const offset =
+        paginaFinal *
+        limite;
+
+    const clientes =
+        db.prepare(`
+            SELECT
+                discord_id,
+                total_centavos,
+                compras,
+                criado_em,
+                atualizado_em
+            FROM clientes
+            WHERE total_centavos > 0
+            ORDER BY
+                total_centavos DESC,
+                compras DESC,
+                atualizado_em ASC,
+                discord_id ASC
+            LIMIT ?
+            OFFSET ?
+        `).all(
+            limite,
+            offset
+        );
+
+    return {
+        clientes,
+        totalClientes,
+        totalPaginas,
+        pagina:
+            paginaFinal,
+        offset
+    };
+}
+
+
+function formatarPosicaoRanking(
+    posicao
+) {
+
+    if (posicao === 1) {
+        return "🥇";
+    }
+
+    if (posicao === 2) {
+        return "🥈";
+    }
+
+    if (posicao === 3) {
+        return "🥉";
+    }
+
+    return `**${posicao}º**`;
+}
+
+
+function montarTopClientes(
+    pagina = 0
+) {
+
+    const dados =
+        obterPaginaTopClientes(
+            pagina,
+            10
+        );
+
+    let descricao;
+
+    if (
+        dados.clientes.length ===
+        0
+    ) {
+
+        descricao =
+            "Ainda não existem clientes com compras aprovadas registradas.";
+
+    } else {
+
+        descricao =
+            dados.clientes
+                .map(
+                    (
+                        cliente,
+                        indice
+                    ) => {
+
+                        const posicao =
+                            dados.offset +
+                            indice +
+                            1;
+
+                        const totalFormatado =
+                            (
+                                Number(
+                                    cliente.total_centavos ||
+                                    0
+                                ) /
+                                100
+                            ).toLocaleString(
+                                "pt-BR",
+                                {
+                                    style:
+                                        "currency",
+                                    currency:
+                                        "BRL"
+                                }
+                            );
+
+                        return (
+                            `${formatarPosicaoRanking(posicao)} <@${cliente.discord_id}>\n` +
+                            `> <:pix:1548090281402966107> **Total gasto:** ${totalFormatado}\n` +
+                            `> <:greencart:1548089836647485591> **Compras:** ${Number(cliente.compras || 0).toLocaleString("pt-BR")}`
+                        );
+                    }
+                )
+                .join(
+                    "\n\n"
+                );
+    }
+
+    const embed =
+        new EmbedBuilder()
+            .setColor(
+                "#00db0f"
+            )
+            .setTitle(
+                "<:coroa:1548189671501078588> Top clientes — RZ Store"
+            )
+            .setDescription(
+                descricao
+            )
+            .setFooter({
+                text:
+                    (
+                        MERCADO_PAGO_TEST_MODE
+                            ? "RZ Store • Banco de TESTE"
+                            : "RZ Store • Ranking por gasto total"
+                    ) +
+                    ` • Página ${dados.pagina + 1}/${dados.totalPaginas}` +
+                    ` • ${dados.totalClientes} cliente(s)`
+            })
+            .setTimestamp();
+
+    const botaoEsquerda =
+        new ButtonBuilder()
+            .setCustomId(
+                `topclientes_pagina_${Math.max(0, dados.pagina - 1)}`
+            )
+            .setEmoji(
+                "⬅️"
+            )
+            .setStyle(
+                ButtonStyle.Secondary
+            )
+            .setDisabled(
+                dados.pagina <= 0
+            );
+
+    const botaoDireita =
+        new ButtonBuilder()
+            .setCustomId(
+                `topclientes_pagina_${Math.min(dados.totalPaginas - 1, dados.pagina + 1)}`
+            )
+            .setEmoji(
+                "➡️"
+            )
+            .setStyle(
+                ButtonStyle.Secondary
+            )
+            .setDisabled(
+                dados.pagina >=
+                dados.totalPaginas - 1
+            );
+
+    const row =
+        new ActionRowBuilder()
+            .addComponents(
+                botaoEsquerda,
+                botaoDireita
+            );
+
+    return {
+        embed,
+        components: [
+            row
+        ],
+        dados
+    };
+}
+
+
 function formatarRobux(
     quantidade
 ) {
@@ -7199,6 +7491,10 @@ client.once("clientReady", async () => {
             .setDescription("Cria o painel de Korblox e Headless"),
 
         new SlashCommandBuilder()
+            .setName("topclientes")
+            .setDescription("Mostra o ranking dos clientes que mais gastaram"),
+
+        new SlashCommandBuilder()
             .setName("cliente")
             .setDescription("Mostra o histórico de um cliente da RZ Store")
             .addUserOption(option =>
@@ -8785,6 +9081,51 @@ client.on(Events.InteractionCreate, async interaction => {
     }
 
     // =========================================
+    // COMANDO /topclientes
+    // =========================================
+
+    if (
+        interaction.isChatInputCommand() &&
+        interaction.commandName === "topclientes"
+    ) {
+
+        if (
+            !interaction.member.roles.cache.has(
+                process.env.STAFF_ROLE_ID
+            )
+        ) {
+
+            await interaction.reply({
+                content:
+                    "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode usar este comando.",
+                flags:
+                    MessageFlags.Ephemeral
+            });
+
+            return;
+        }
+
+        const painel =
+            montarTopClientes(
+                0
+            );
+
+        await interaction.reply({
+            embeds: [
+                painel.embed
+            ],
+            components:
+                painel.components,
+            allowedMentions: {
+                parse: []
+            }
+        });
+
+        return;
+    }
+
+
+    // =========================================
     // COMANDO /cliente
     // =========================================
 
@@ -8902,6 +9243,11 @@ client.on(Events.InteractionCreate, async interaction => {
         const totalCentavos =
             Number(
                 cliente.total_centavos || 0
+            );
+
+        const rankingCliente =
+            obterPosicaoClienteRanking(
+                discordId
             );
 
         const totalFormatado =
@@ -9077,7 +9423,12 @@ client.on(Events.InteractionCreate, async interaction => {
 
                     `### <:pix:1548090281402966107> Histórico\n` +
                     `> **Total gasto:** ${totalFormatado}\n` +
-                    `> **Compras aprovadas:** ${cliente.compras}\n\n` +
+                    `> **Compras aprovadas:** ${cliente.compras}\n` +
+                    (
+                        rankingCliente
+                            ? `> <:coroa:1548189671501078588> **Posição no top:** **#${rankingCliente.posicao}** de **${rankingCliente.total}** cliente(s)\n\n`
+                            : "\n"
+                    ) +
 
                     `### <:coroa:1548189671501078588> Fidelidade\n` +
                     `> **Cargo atual:** ${textoCargoAtual}\n` +
@@ -10676,6 +11027,64 @@ client.on(Events.InteractionCreate, async interaction => {
     // =========================================
 
     if (interaction.isButton()) {
+
+        // =========================================
+        // PAGINAÇÃO /topclientes
+        // =========================================
+
+        if (
+            interaction.customId.startsWith(
+                "topclientes_pagina_"
+            )
+        ) {
+
+            if (
+                !interaction.member.roles.cache.has(
+                    process.env.STAFF_ROLE_ID
+                )
+            ) {
+
+                await interaction.reply({
+                    content:
+                        "<:x_:1549124126575165533> Apenas a equipe da RZ Store pode trocar as páginas deste ranking.",
+                    flags:
+                        MessageFlags.Ephemeral
+                });
+
+                return;
+            }
+
+            const pagina =
+                Number(
+                    interaction.customId.replace(
+                        "topclientes_pagina_",
+                        ""
+                    )
+                );
+
+            const painel =
+                montarTopClientes(
+                    Number.isInteger(
+                        pagina
+                    )
+                        ? pagina
+                        : 0
+                );
+
+            await interaction.update({
+                embeds: [
+                    painel.embed
+                ],
+                components:
+                    painel.components,
+                allowedMentions: {
+                    parse: []
+                }
+            });
+
+            return;
+        }
+
 
         // =========================================
         // ENVIAR NICK / ID DO ROBLOX

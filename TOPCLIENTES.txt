@@ -1,0 +1,15 @@
+RZ STORE - TOP CLIENTES
+
+/topclientes
+- somente a staff pode executar;
+- a resposta aparece publicamente;
+- mostra 10 clientes por página;
+- ranking por total gasto;
+- desempate: mais compras, data de atualização mais antiga e Discord ID;
+- setas esquerda/direita abaixo do embed;
+- somente membros com STAFF_ROLE_ID podem usar as setas.
+
+/cliente
+- continua somente para staff;
+- resposta continua pública;
+- agora mostra a posição do cliente no ranking geral.

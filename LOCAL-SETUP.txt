@@ -53,3 +53,6 @@ FUNCIONALIDADES SINCRONIZADAS COM A BUILD RAILWAY:
 - modo manutenção
 - logs de staff
 - recuperação de webhook/processamento parcial
+
+- /topclientes com ranking público paginado (setas somente para staff)
+- /cliente mostra posição no ranking
