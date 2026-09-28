@@ -1,20 +1,21 @@
 {
-  "name": "rz-store-bot",
+  "name": "rz-store-bot-local",
   "version": "1.0.0",
-  "description": "",
+  "private": true,
+  "description": "RZ Store Discord bot - versão local",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "check": "node --check index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
+  "engines": {
+    "node": "24.x"
+  },
   "dependencies": {
-    "discord.js": "^14.27.0",
-    "dotenv": "^17.4.2",
-    "express": "^5.2.1",
-    "mercadopago": "^3.6.1",
+    "discord.js": "^14.22.1",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "mercadopago": "^2.9.0",
     "qrcode": "^1.5.4"
   }
 }

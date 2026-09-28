@@ -1,0 +1,55 @@
+RZ STORE - VERSÃO LOCAL ATUALIZADA
+
+Esta é a versão para rodar no seu PC / servidor local.
+Ela contém as mesmas funcionalidades da build atual do Railway,
+mas o banco SQLite e os backups ficam na pasta do projeto.
+
+ARQUIVOS:
+- rz-store-test.db -> banco de TESTE
+- rz-store.db      -> banco de PRODUÇÃO
+- backups/         -> backups automáticos
+
+COMO RODAR:
+1. Instale Node.js 24.
+2. Abra a pasta no terminal.
+3. Rode:
+   npm install
+4. Copie .env.example para .env e preencha suas variáveis.
+5. Rode:
+   npm start
+
+WEBHOOK LOCAL:
+O Mercado Pago precisa de uma URL HTTPS pública.
+Se estiver rodando no PC, exponha a porta configurada (padrão 3000)
+com um túnel, por exemplo Cloudflare Tunnel.
+
+Endpoint:
+https://SEU-TUNEL/mercadopago/webhook
+
+IMPORTANTE:
+- Nunca envie .env para o GitHub.
+- *.db e backups/ já estão no .gitignore.
+- PRECO_1000_ROBUX controla todos os preços do bot.
+- LIMITE_PEDIDO_PERCENTUAL controla quanto do estoque disponível
+  pode ser reservado em um único pedido.
+
+FUNCIONALIDADES SINCRONIZADAS COM A BUILD RAILWAY:
+- Mercado Pago / PIX / webhook assinado
+- ticket privado e reserva de estoque
+- expiração automática
+- fechamento seguro de tickets
+- SQLite teste/produção
+- backup automático + integrity_check
+- estoque + painel em tempo real
+- limite de pedido configurável
+- preço do Robux configurável pelo .env
+- atualização automática dos painéis de compra
+- Korblox / Headless com preço automático
+- cupons
+- fidelidade/cargos
+- entrega + logs + DM
+- /cliente
+- painel de vendas
+- modo manutenção
+- logs de staff
+- recuperação de webhook/processamento parcial

@@ -1,5 +1,4 @@
-node_modules
-
+node_modules/
 .env
 
 *.db
@@ -7,3 +6,4 @@ node_modules
 *.db-wal
 
 backups/
+.DS_Store

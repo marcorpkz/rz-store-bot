@@ -63,7 +63,7 @@ const CARGOS_EM_TESTE =
     process.env.CARGOS_EM_TESTE === "true";
 
 // Banco de teste separado do banco real.
-// Assim, os testes do Mercado Pago não misturam os gastos reais.
+// Na versão LOCAL os arquivos ficam dentro da própria pasta do bot.
 const DATABASE_FILE =
     path.join(
         __dirname,
@@ -80,9 +80,15 @@ const db = new DatabaseSync(DATABASE_FILE);
 
 const BACKUP_DIR =
     process.env.BACKUP_DIR?.trim()
-        ? path.resolve(
-            __dirname,
-            process.env.BACKUP_DIR.trim()
+        ? (
+            path.isAbsolute(
+                process.env.BACKUP_DIR.trim()
+            )
+                ? process.env.BACKUP_DIR.trim()
+                : path.resolve(
+                    __dirname,
+                    process.env.BACKUP_DIR.trim()
+                )
         )
         : path.join(
             __dirname,
@@ -1551,6 +1557,80 @@ function obterEstoqueDisponivel(
 }
 
 
+function obterPercentualLimitePedido() {
+
+    const percentualConfigurado =
+        Number(
+            process.env
+                .LIMITE_PEDIDO_PERCENTUAL ||
+            100
+        );
+
+    if (
+        !Number.isFinite(
+            percentualConfigurado
+        )
+    ) {
+        return 100;
+    }
+
+    return Math.min(
+        100,
+        Math.max(
+            1,
+            percentualConfigurado
+        )
+    );
+}
+
+
+function calcularLimitePedidoPorDisponivel(
+    disponivel
+) {
+
+    const disponivelNumero =
+        Math.max(
+            0,
+            Number(
+                disponivel
+            ) || 0
+        );
+
+    const percentual =
+        obterPercentualLimitePedido();
+
+    if (
+        disponivelNumero <= 0
+    ) {
+        return 0;
+    }
+
+    const limiteCalculado =
+        Math.floor(
+            disponivelNumero *
+            percentual /
+            100
+        );
+
+    // Mantém possível o pedido mínimo de 100 Robux quando
+    // houver pelo menos 100 disponíveis, mesmo se um percentual
+    // futuro muito baixo resultar em menos de 100.
+    if (
+        disponivelNumero >= 100
+    ) {
+        return Math.min(
+            disponivelNumero,
+            Math.max(
+                100,
+                limiteCalculado
+            )
+        );
+    }
+
+    return disponivelNumero;
+}
+
+
 function obterLimiteMaximoPedido(
     excluirChannelId = null
 ) {
@@ -1560,12 +1640,9 @@ function obterLimiteMaximoPedido(
             excluirChannelId
         );
 
-    return disponivel >= 200
-        ? Math.floor(
-            disponivel /
-            2
-        )
-        : disponivel;
+    return calcularLimitePedidoPorDisponivel(
+        disponivel
+    );
 }
 
 
@@ -1585,12 +1662,12 @@ function validarLimiteMaximoPedido({
         );
 
     const limiteAplicavel =
-        disponivel >= 200
-            ? Math.floor(
-                disponivel /
-                2
-            )
-            : disponivel;
+        obterLimiteMaximoPedido(
+            excluirChannelId
+        );
+
+    const percentual =
+        obterPercentualLimitePedido();
 
     if (
         !Number.isInteger(
@@ -1615,7 +1692,7 @@ function validarLimiteMaximoPedido({
         return {
             valido: false,
             motivo:
-                `Para manter Robux disponíveis para outros clientes, cada pedido pode usar no máximo **50% do estoque disponível**.\n\n` +
+                `Este pedido ultrapassa o limite configurado de **${percentual}% do estoque disponível**.\n\n` +
                 `> <:greenrbx:1548088739677470881> **Disponível agora:** ${formatarRobux(disponivel)} Robux\n` +
                 `> <:greencart:1548089836647485591> **Máximo por pedido:** ${formatarRobux(limiteAplicavel)} Robux`,
             limite:
@@ -1716,12 +1793,9 @@ function reservarPedidoEmAberto({
             );
 
         const limitePedido =
-            disponivelAntes >= 200
-                ? Math.floor(
-                    disponivelAntes /
-                    2
-                )
-                : disponivelAntes;
+            calcularLimitePedidoPorDisponivel(
+                disponivelAntes
+            );
 
         if (
             quantidadeNumero >
@@ -1746,7 +1820,7 @@ function reservarPedidoEmAberto({
                 motivo:
                     quantidadeNumero >
                     limitePedido
-                        ? "limite_metade"
+                        ? "limite_percentual"
                         : "estoque"
             };
         }
@@ -3064,6 +3138,658 @@ function formatarMoedaCentavos(
 }
 
 
+function obterPreco1000RobuxCentavos() {
+
+    const bruto =
+        String(
+            process.env
+                .PRECO_1000_ROBUX ??
+            "36"
+        )
+            .trim()
+            .replace(
+                ",",
+                "."
+            );
+
+    const reais =
+        Number(
+            bruto
+        );
+
+    if (
+        !Number.isFinite(
+            reais
+        ) ||
+        reais <= 0
+    ) {
+
+        console.warn(
+            `[PREÇO] PRECO_1000_ROBUX inválido (${bruto}). Usando R$ 36,00 por 1.000 Robux.`
+        );
+
+        return 3600;
+    }
+
+    return Math.round(
+        reais *
+        100
+    );
+}
+
+
+function calcularValorRobuxCentavos(
+    quantidade
+) {
+
+    const quantidadeNumero =
+        Number(
+            quantidade
+        );
+
+    if (
+        !Number.isFinite(
+            quantidadeNumero
+        ) ||
+        quantidadeNumero <= 0
+    ) {
+        return 0;
+    }
+
+    return Math.round(
+        quantidadeNumero *
+        obterPreco1000RobuxCentavos() /
+        1000
+    );
+}
+
+
+function formatarPrecoRobux(
+    quantidade
+) {
+
+    return formatarMoedaCentavos(
+        calcularValorRobuxCentavos(
+            quantidade
+        )
+    );
+}
+
+
+function obterConfiguracaoValor(
+    chave
+) {
+
+    const linha =
+        db.prepare(`
+            SELECT valor
+            FROM configuracoes
+            WHERE chave = ?
+        `).get(
+            chave
+        );
+
+    return linha?.valor || null;
+}
+
+
+function salvarConfiguracaoValor(
+    chave,
+    valor
+) {
+
+    db.prepare(`
+        INSERT INTO configuracoes (
+            chave,
+            valor
+        )
+        VALUES (?, ?)
+
+        ON CONFLICT(chave)
+        DO UPDATE SET
+            valor =
+                excluded.valor
+    `).run(
+        chave,
+        String(
+            valor
+        )
+    );
+}
+
+
+async function encontrarPainelNoCanal(
+    canal,
+    titulo
+) {
+
+    try {
+
+        const mensagens =
+            await canal.messages.fetch({
+                limit:
+                    100
+            });
+
+        return mensagens.find(
+            mensagem =>
+                mensagem.author?.id ===
+                    client.user.id &&
+                mensagem.embeds.some(
+                    embed =>
+                        embed.title ===
+                        titulo
+                )
+        ) || null;
+
+    } catch (error) {
+
+        console.warn(
+            `[PREÇO] Não consegui procurar o painel "${titulo}" em ${canal?.id}:`,
+            error?.message ||
+            error
+        );
+
+        return null;
+    }
+}
+
+
+async function encontrarPainelCompraExistenteGuild(
+    guild,
+    customId
+) {
+
+    const canais =
+        guild.channels.cache.filter(
+            canal =>
+                canal &&
+                canal.type ===
+                    ChannelType.GuildText &&
+                canal.isTextBased?.()
+        );
+
+    for (
+        const canal
+        of canais.values()
+    ) {
+
+        try {
+
+            const mensagens =
+                await canal.messages.fetch({
+                    limit:
+                        100
+                });
+
+            const painel =
+                mensagens.find(
+                    mensagem =>
+                        mensagem.author?.id ===
+                            client.user.id &&
+                        mensagem.components.some(
+                            row =>
+                                row.components.some(
+                                    componente =>
+                                        componente.customId ===
+                                        customId
+                                )
+                        )
+                );
+
+            if (painel) {
+
+                console.log(
+                    `[PREÇO] Painel ${customId} encontrado automaticamente em #${canal.name}.`
+                );
+
+                return {
+                    canal,
+                    mensagem:
+                        painel
+                };
+            }
+
+        } catch {}
+    }
+
+    return null;
+}
+
+
+function atualizarComponentesPrecoRobux(
+    componentes
+) {
+
+    return componentes.map(
+        row => {
+
+            const data =
+                row.toJSON();
+
+            for (
+                const componente
+                of data.components ||
+                []
+            ) {
+
+                if (
+                    componente.custom_id ===
+                        "comprar_robux" &&
+                    Array.isArray(
+                        componente.options
+                    )
+                ) {
+
+                    componente.options =
+                        componente.options.map(
+                            opcao => {
+
+                                const quantidade =
+                                    Number(
+                                        opcao.value
+                                    );
+
+                                if (
+                                    !Number.isInteger(
+                                        quantidade
+                                    ) ||
+                                    quantidade <= 0
+                                ) {
+                                    return opcao;
+                                }
+
+                                return {
+                                    ...opcao,
+                                    description:
+                                        `Preço: ${formatarPrecoRobux(quantidade)}`
+                                };
+                            }
+                        );
+                }
+            }
+
+            return data;
+        }
+    );
+}
+
+
+function atualizarComponentesPrecoKorblox(
+    componentes
+) {
+
+    return componentes.map(
+        row => {
+
+            const data =
+                row.toJSON();
+
+            for (
+                const componente
+                of data.components ||
+                []
+            ) {
+
+                if (
+                    componente.custom_id ===
+                        "comprar_korblox_headless" &&
+                    Array.isArray(
+                        componente.options
+                    )
+                ) {
+
+                    componente.options =
+                        componente.options.map(
+                            opcao => {
+
+                                let quantidade =
+                                    null;
+
+                                if (
+                                    opcao.value ===
+                                    "korblox"
+                                ) {
+                                    quantidade =
+                                        17000;
+                                }
+
+                                if (
+                                    opcao.value ===
+                                    "headless"
+                                ) {
+                                    quantidade =
+                                        31000;
+                                }
+
+                                if (!quantidade) {
+                                    return opcao;
+                                }
+
+                                return {
+                                    ...opcao,
+                                    description:
+                                        `${formatarRobux(quantidade)} Robux • ${formatarPrecoRobux(quantidade)}`
+                                };
+                            }
+                        );
+                }
+            }
+
+            return data;
+        }
+    );
+}
+
+
+async function atualizarPainelCompraRobuxSalvo(
+    guild
+) {
+
+    let canalId =
+        obterConfiguracaoValor(
+            "painel_comprar_channel_id"
+        );
+
+    let mensagemId =
+        obterConfiguracaoValor(
+            "painel_comprar_message_id"
+        );
+
+    let canal = null;
+    let mensagem = null;
+
+    try {
+
+        if (
+            canalId &&
+            mensagemId
+        ) {
+
+            canal =
+                await guild.channels.fetch(
+                    canalId
+                );
+
+            if (
+                canal &&
+                canal.isTextBased()
+            ) {
+                mensagem =
+                    await canal.messages.fetch(
+                        mensagemId
+                    );
+            }
+        }
+
+    } catch {}
+
+    if (!mensagem) {
+
+        const encontrado =
+            await encontrarPainelCompraExistenteGuild(
+                guild,
+                "comprar_robux"
+            );
+
+        if (!encontrado) {
+
+            console.warn(
+                "[PREÇO] Painel de Robux não encontrado automaticamente. Rode /setupcomprar uma vez."
+            );
+
+            return false;
+        }
+
+        canal =
+            encontrado.canal;
+
+        mensagem =
+            encontrado.mensagem;
+
+        salvarConfiguracaoValor(
+            "painel_comprar_channel_id",
+            canal.id
+        );
+
+        salvarConfiguracaoValor(
+            "painel_comprar_message_id",
+            mensagem.id
+        );
+    }
+
+    try {
+
+        const embedAtual =
+            mensagem.embeds[0];
+
+        if (!embedAtual) {
+            return false;
+        }
+
+        const descricao =
+            String(
+                embedAtual.description ||
+                ""
+            )
+                .split("\n")
+                .map(
+                    linha =>
+                        linha.includes(
+                            "100 custa"
+                        )
+                            ? `> <a:animatedarrowgreen:1548150127414480966> Cada **<:greenrbx:1548088739677470881> 100 custa ${formatarPrecoRobux(100)}**.`
+                            : linha
+                )
+                .join("\n");
+
+        const embed =
+            new EmbedBuilder(
+                embedAtual.toJSON()
+            )
+                .setDescription(
+                    descricao
+                )
+                .setImage(
+                    "attachment://comprar-banner.png"
+                );
+
+        await mensagem.edit({
+            embeds: [
+                embed
+            ],
+            components:
+                atualizarComponentesPrecoRobux(
+                    mensagem.components
+                )
+        });
+
+        console.log(
+            `[PREÇO] Painel de Robux atualizado para ${formatarMoedaCentavos(obterPreco1000RobuxCentavos())} / 1.000 Robux.`
+        );
+
+        return true;
+
+    } catch (error) {
+
+        console.warn(
+            "[PREÇO] Não foi possível atualizar automaticamente o painel de Robux:",
+            error?.message ||
+            error
+        );
+
+        return false;
+    }
+}
+
+async function atualizarPainelKorbloxSalvo(
+    guild
+) {
+
+    let canalId =
+        obterConfiguracaoValor(
+            "painel_korblox_channel_id"
+        );
+
+    let mensagemId =
+        obterConfiguracaoValor(
+            "painel_korblox_message_id"
+        );
+
+    let canal = null;
+    let mensagem = null;
+
+    try {
+
+        if (
+            canalId &&
+            mensagemId
+        ) {
+
+            canal =
+                await guild.channels.fetch(
+                    canalId
+                );
+
+            if (
+                canal &&
+                canal.isTextBased()
+            ) {
+                mensagem =
+                    await canal.messages.fetch(
+                        mensagemId
+                    );
+            }
+        }
+
+    } catch {}
+
+    if (!mensagem) {
+
+        const encontrado =
+            await encontrarPainelCompraExistenteGuild(
+                guild,
+                "comprar_korblox_headless"
+            );
+
+        if (!encontrado) {
+
+            console.warn(
+                "[PREÇO] Painel de Korblox/Headless não encontrado automaticamente. Rode /korblox uma vez."
+            );
+
+            return false;
+        }
+
+        canal =
+            encontrado.canal;
+
+        mensagem =
+            encontrado.mensagem;
+
+        salvarConfiguracaoValor(
+            "painel_korblox_channel_id",
+            canal.id
+        );
+
+        salvarConfiguracaoValor(
+            "painel_korblox_message_id",
+            mensagem.id
+        );
+    }
+
+    try {
+
+        const embedAtual =
+            mensagem.embeds[0];
+
+        if (!embedAtual) {
+            return false;
+        }
+
+        const descricao =
+            String(
+                embedAtual.description ||
+                ""
+            )
+                .split("\n")
+                .map(
+                    linha => {
+
+                        if (
+                            linha.includes(
+                                "**Korblox:**"
+                            )
+                        ) {
+                            return `> <a:animatedarrowgreen:1548150127414480966> **Korblox:** 17.000 Robux — **${formatarPrecoRobux(17000)}**`;
+                        }
+
+                        if (
+                            linha.includes(
+                                "**Headless:**"
+                            )
+                        ) {
+                            return `> <a:animatedarrowgreen:1548150127414480966> **Headless:** 31.000 Robux — **${formatarPrecoRobux(31000)}**`;
+                        }
+
+                        return linha;
+                    }
+                )
+                .join("\n");
+
+        const embed =
+            new EmbedBuilder(
+                embedAtual.toJSON()
+            )
+                .setDescription(
+                    descricao
+                )
+                .setImage(
+                    "attachment://korblox-headless.png"
+                );
+
+        await mensagem.edit({
+            embeds: [
+                embed
+            ],
+            components:
+                atualizarComponentesPrecoKorblox(
+                    mensagem.components
+                )
+        });
+
+        console.log(
+            `[PREÇO] Painel Korblox/Headless atualizado: ${formatarPrecoRobux(17000)} / ${formatarPrecoRobux(31000)}.`
+        );
+
+        return true;
+
+    } catch (error) {
+
+        console.warn(
+            "[PREÇO] Não foi possível atualizar automaticamente o painel de Korblox/Headless:",
+            error?.message ||
+            error
+        );
+
+        return false;
+    }
+}
+
+async function atualizarPaineisCompraPorPreco(
+    guild
+) {
+
+    await atualizarPainelCompraRobuxSalvo(
+        guild
+    );
+
+    await atualizarPainelKorbloxSalvo(
+        guild
+    );
+}
+
+
 function obterResumoVendas(
     whereSql = "",
     parametros = []
@@ -3582,7 +4308,7 @@ async function atualizarPainelEstoque(
                     (
                         manutencaoAtiva
                             ? "<:ampulheta:1549129208557469786> As vendas serão liberadas novamente assim que a manutenção terminar."
-                            : "<a:greensparkles:1548099963051843695> Cada pedido pode utilizar no máximo **50% do estoque disponível**. Este painel é atualizado automaticamente conforme novas compras, pagamentos e alterações no estoque."
+                            : `<a:greensparkles:1548099963051843695> Cada pedido pode utilizar até **${obterPercentualLimitePedido()}% do estoque disponível**. Este painel é atualizado automaticamente conforme novas compras, pagamentos e alterações no estoque.`
                     )
                 )
                 .setImage(
@@ -6329,6 +7055,9 @@ client.once("clientReady", async () => {
         `[MANUTENÇÃO] Estado atual: ${obterModoManutencao() ? "ATIVADA" : "DESATIVADA"}.`
     );
     console.log(
+        `[PREÇO] ${formatarMoedaCentavos(obterPreco1000RobuxCentavos())} por 1.000 Robux.`
+    );
+    console.log(
         `[BACKUP] Banco atual: ${MERCADO_PAGO_TEST_MODE ? "TESTE" : "PRODUÇÃO"} • intervalo: ${BACKUP_INTERVAL_HOURS}h • retenção: ${BACKUP_KEEP}.`
     );
     console.log(
@@ -6398,6 +7127,10 @@ client.once("clientReady", async () => {
         );
 
         await sincronizarMensagensPedidosPagos(
+            guildEstoque
+        );
+
+        await atualizarPaineisCompraPorPreco(
             guildEstoque
         );
 
@@ -8417,7 +9150,7 @@ client.on(Events.InteractionCreate, async interaction => {
                 "<:greencart:1548089836647485591> **— COMO FUNCIONA A COMPRA**\n" +
                 "> <a:animatedarrowgreen:1548150127414480966> Selecione abaixo a quantidade de Robux desejada.\n" +
                 "> <a:animatedarrowgreen:1548150127414480966> Você também pode escolher uma quantidade personalizada.\n" +
-                "> <a:animatedarrowgreen:1548150127414480966> Cada **<:greenrbx:1548088739677470881> 100 custa R$ 3,20**.\n\n" +
+                `> <a:animatedarrowgreen:1548150127414480966> Cada **<:greenrbx:1548088739677470881> 100 custa ${formatarPrecoRobux(100)}**.\n\n` +
 
                 "<:pix:1548090281402966107> **— APÓS O PAGAMENTO**\n" +
                 "> <a:greenverification:1548192162653536336> O pagamento será confirmado automaticamente.\n" +
@@ -8458,7 +9191,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("200 Robux")
-                    .setDescription("Preço: R$ 6,40")
+                    .setDescription(`Preço: ${formatarPrecoRobux(200)}`)
                     .setValue("200")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8467,7 +9200,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("300 Robux")
-                    .setDescription("Preço: R$ 9,60")
+                    .setDescription(`Preço: ${formatarPrecoRobux(300)}`)
                     .setValue("300")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8476,7 +9209,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("400 Robux")
-                    .setDescription("Preço: R$ 12,80")
+                    .setDescription(`Preço: ${formatarPrecoRobux(400)}`)
                     .setValue("400")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8485,7 +9218,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("500 Robux")
-                    .setDescription("Preço: R$ 16,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(500)}`)
                     .setValue("500")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8494,7 +9227,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("600 Robux")
-                    .setDescription("Preço: R$ 19,20")
+                    .setDescription(`Preço: ${formatarPrecoRobux(600)}`)
                     .setValue("600")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8503,7 +9236,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("700 Robux")
-                    .setDescription("Preço: R$ 22,40")
+                    .setDescription(`Preço: ${formatarPrecoRobux(700)}`)
                     .setValue("700")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8512,7 +9245,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("800 Robux")
-                    .setDescription("Preço: R$ 25,60")
+                    .setDescription(`Preço: ${formatarPrecoRobux(800)}`)
                     .setValue("800")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8521,7 +9254,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("900 Robux")
-                    .setDescription("Preço: R$ 28,80")
+                    .setDescription(`Preço: ${formatarPrecoRobux(900)}`)
                     .setValue("900")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8530,7 +9263,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("1.000 Robux")
-                    .setDescription("Preço: R$ 32,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(1000)}`)
                     .setValue("1000")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8539,7 +9272,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("1.500 Robux")
-                    .setDescription("Preço: R$ 48,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(1500)}`)
                     .setValue("1500")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8548,7 +9281,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("2.000 Robux")
-                    .setDescription("Preço: R$ 64,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(2000)}`)
                     .setValue("2000")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8557,7 +9290,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("2.500 Robux")
-                    .setDescription("Preço: R$ 80,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(2500)}`)
                     .setValue("2500")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8566,7 +9299,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("3.000 Robux")
-                    .setDescription("Preço: R$ 96,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(3000)}`)
                     .setValue("3000")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8575,7 +9308,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("4.000 Robux")
-                    .setDescription("Preço: R$ 128,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(4000)}`)
                     .setValue("4000")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8584,7 +9317,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("5.000 Robux")
-                    .setDescription("Preço: R$ 160,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(5000)}`)
                     .setValue("5000")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8593,7 +9326,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("10.000 Robux")
-                    .setDescription("Preço: R$ 320,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(10000)}`)
                     .setValue("10000")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8602,7 +9335,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("20.000 Robux")
-                    .setDescription("Preço: R$ 640,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(20000)}`)
                     .setValue("20000")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8611,7 +9344,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("30.000 Robux")
-                    .setDescription("Preço: R$ 960,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(30000)}`)
                     .setValue("30000")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8620,7 +9353,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("40.000 Robux")
-                    .setDescription("Preço: R$ 1.280,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(40000)}`)
                     .setValue("40000")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8629,7 +9362,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("50.000 Robux")
-                    .setDescription("Preço: R$ 1.600,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(50000)}`)
                     .setValue("50000")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8638,7 +9371,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("100.000 Robux")
-                    .setDescription("Preço: R$ 3.200,00")
+                    .setDescription(`Preço: ${formatarPrecoRobux(100000)}`)
                     .setValue("100000")
                     .setEmoji({
                         id: "1548088739677470881",
@@ -8654,18 +9387,75 @@ client.on(Events.InteractionCreate, async interaction => {
             flags: MessageFlags.Ephemeral
         });
 
-        await interaction.channel.send({
-            embeds: [embed],
-            components: [row],
-            files: [
-                {
-                    attachment:
-                        caminhoBannerCompra,
-                    name:
+        let mensagemPainel =
+            await encontrarPainelNoCanal(
+                interaction.channel,
+                "<:greenrbx:1548088739677470881> Comprar Robux — RZ Store"
+            );
+
+        if (mensagemPainel) {
+
+            const payload = {
+                embeds: [
+                    embed
+                ],
+                components: [
+                    row
+                ]
+            };
+
+            const temBanner =
+                mensagemPainel.attachments.some(
+                    anexo =>
+                        anexo.name ===
                         "comprar-banner.png"
-                }
-            ]
-        });
+                );
+
+            if (!temBanner) {
+                payload.files = [
+                    {
+                        attachment:
+                            caminhoBannerCompra,
+                        name:
+                            "comprar-banner.png"
+                    }
+                ];
+            }
+
+            await mensagemPainel.edit(
+                payload
+            );
+
+        } else {
+
+            mensagemPainel =
+                await interaction.channel.send({
+                    embeds: [
+                        embed
+                    ],
+                    components: [
+                        row
+                    ],
+                    files: [
+                        {
+                            attachment:
+                                caminhoBannerCompra,
+                            name:
+                                "comprar-banner.png"
+                        }
+                    ]
+                });
+        }
+
+        salvarConfiguracaoValor(
+            "painel_comprar_channel_id",
+            interaction.channel.id
+        );
+
+        salvarConfiguracaoValor(
+            "painel_comprar_message_id",
+            mensagemPainel.id
+        );
 
         return;
     }
@@ -8712,8 +9502,8 @@ client.on(Events.InteractionCreate, async interaction => {
                 "## ‹ KORBLOX & HEADLESS ⇄ RZ STORE ›\n\n" +
 
                 "<:greencart:1548089836647485591> **— ESCOLHA SEU ITEM**\n" +
-                "> <a:animatedarrowgreen:1548150127414480966> **Korblox:** 17.000 Robux — **R$ 544,00**\n" +
-                "> <a:animatedarrowgreen:1548150127414480966> **Headless:** 31.000 Robux — **R$ 992,00**\n\n" +
+                `> <a:animatedarrowgreen:1548150127414480966> **Korblox:** 17.000 Robux — **${formatarPrecoRobux(17000)}**\n` +
+                `> <a:animatedarrowgreen:1548150127414480966> **Headless:** 31.000 Robux — **${formatarPrecoRobux(31000)}**\n\n` +
 
                 "<:pix:1548090281402966107> **— COMO FUNCIONA A COMPRA**\n" +
                 "> <a:animatedarrowgreen:1548150127414480966> Selecione abaixo a quantidade de Robux que deseja comprar.\n" +
@@ -8741,7 +9531,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("Korblox")
-                    .setDescription("17.000 Robux • R$ 544,00")
+                    .setDescription(`17.000 Robux • ${formatarPrecoRobux(17000)}`)
                     .setValue("korblox")
                     .setEmoji({
                         id: "1549132176048525363",
@@ -8750,7 +9540,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 new StringSelectMenuOptionBuilder()
                     .setLabel("Headless")
-                    .setDescription("31.000 Robux • R$ 992,00")
+                    .setDescription(`31.000 Robux • ${formatarPrecoRobux(31000)}`)
                     .setValue("headless")
                     .setEmoji({
                         id: "1549132702249259109",
@@ -8766,18 +9556,75 @@ client.on(Events.InteractionCreate, async interaction => {
             flags: MessageFlags.Ephemeral
         });
 
-        await interaction.channel.send({
-            embeds: [embedKorblox],
-            components: [rowKorblox],
-            files: [
-                {
-                    attachment:
-                        caminhoBannerKorblox,
-                    name:
+        let mensagemPainelKorblox =
+            await encontrarPainelNoCanal(
+                interaction.channel,
+                "<:coroa:1548189671501078588> Korblox & Headless — RZ Store"
+            );
+
+        if (mensagemPainelKorblox) {
+
+            const payload = {
+                embeds: [
+                    embedKorblox
+                ],
+                components: [
+                    rowKorblox
+                ]
+            };
+
+            const temBanner =
+                mensagemPainelKorblox.attachments.some(
+                    anexo =>
+                        anexo.name ===
                         "korblox-headless.png"
-                }
-            ]
-        });
+                );
+
+            if (!temBanner) {
+                payload.files = [
+                    {
+                        attachment:
+                            caminhoBannerKorblox,
+                        name:
+                            "korblox-headless.png"
+                    }
+                ];
+            }
+
+            await mensagemPainelKorblox.edit(
+                payload
+            );
+
+        } else {
+
+            mensagemPainelKorblox =
+                await interaction.channel.send({
+                    embeds: [
+                        embedKorblox
+                    ],
+                    components: [
+                        rowKorblox
+                    ],
+                    files: [
+                        {
+                            attachment:
+                                caminhoBannerKorblox,
+                            name:
+                                "korblox-headless.png"
+                        }
+                    ]
+                });
+        }
+
+        salvarConfiguracaoValor(
+            "painel_korblox_channel_id",
+            interaction.channel.id
+        );
+
+        salvarConfiguracaoValor(
+            "painel_korblox_message_id",
+            mensagemPainelKorblox.id
+        );
 
         return;
     }
@@ -8793,9 +9640,13 @@ client.on(Events.InteractionCreate, async interaction => {
     ) {
 
         const opcao = interaction.values[0];
+
         await interaction.message.edit({
-    components: interaction.message.components.map(row => row.toJSON())
-});
+            components:
+                atualizarComponentesPrecoRobux(
+                    interaction.message.components
+                )
+        });
 
         // =========================================
         // QUANTIDADE PERSONALIZADA
@@ -8833,12 +9684,15 @@ client.on(Events.InteractionCreate, async interaction => {
 
         const quantidade = Number(opcao);
 
-        const valor = (quantidade / 100) * 3.20;
+        const valorCentavos =
+            calcularValorRobuxCentavos(
+                quantidade
+            );
 
-        const valorFormatado = valor.toLocaleString("pt-BR", {
-            style: "currency",
-            currency: "BRL"
-        });
+        const valorFormatado =
+            formatarMoedaCentavos(
+                valorCentavos
+            );
 
         const quantidadeFormatada =
             quantidade.toLocaleString("pt-BR");
@@ -8913,19 +9767,28 @@ client.on(Events.InteractionCreate, async interaction => {
         const opcao = interaction.values[0];
 
         await interaction.message.edit({
-            components: interaction.message.components.map(row => row.toJSON())
+            components:
+                atualizarComponentesPrecoKorblox(
+                    interaction.message.components
+                )
         });
 
         const produtos = {
             korblox: {
                 nome: "Korblox",
                 robux: 17000,
-                valor: 544
+                valorCentavos:
+                    calcularValorRobuxCentavos(
+                        17000
+                    )
             },
             headless: {
                 nome: "Headless",
                 robux: 31000,
-                valor: 992
+                valorCentavos:
+                    calcularValorRobuxCentavos(
+                        31000
+                    )
             }
         };
 
@@ -8940,10 +9803,10 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         const robuxFormatado = produto.robux.toLocaleString("pt-BR");
-        const valorFormatado = produto.valor.toLocaleString("pt-BR", {
-            style: "currency",
-            currency: "BRL"
-        });
+        const valorFormatado =
+            formatarMoedaCentavos(
+                produto.valorCentavos
+            );
 
         const embedConfirmacaoItem = new EmbedBuilder()
             .setColor("#00db0f")
@@ -9027,12 +9890,15 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
 
-        const valor = (quantidade / 100) * 3.20;
+        const valorCentavos =
+            calcularValorRobuxCentavos(
+                quantidade
+            );
 
-        const valorFormatado = valor.toLocaleString("pt-BR", {
-            style: "currency",
-            currency: "BRL"
-        });
+        const valorFormatado =
+            formatarMoedaCentavos(
+                valorCentavos
+            );
 
         const quantidadeFormatada =
             quantidade.toLocaleString("pt-BR");
@@ -9615,12 +10481,8 @@ client.on(Events.InteractionCreate, async interaction => {
             }
 
             valorOriginalCentavos =
-                Math.round(
-                    (
-                        quantidade /
-                        100
-                    ) *
-                    320
+                calcularValorRobuxCentavos(
+                    quantidade
                 );
 
             titulo =
@@ -9641,7 +10503,9 @@ client.on(Events.InteractionCreate, async interaction => {
                     robux:
                         17000,
                     valorCentavos:
-                        54400
+                        calcularValorRobuxCentavos(
+                            17000
+                        )
                 },
                 headless: {
                     nome:
@@ -9649,7 +10513,9 @@ client.on(Events.InteractionCreate, async interaction => {
                     robux:
                         31000,
                     valorCentavos:
-                        99200
+                        calcularValorRobuxCentavos(
+                            31000
+                        )
                 }
             };
 
@@ -10934,13 +11800,9 @@ client.on(Events.InteractionCreate, async interaction => {
     }
 
     const valorOriginalCentavos =
-        Math.round(
-            (
-                quantidade /
-                100
-            ) *
-            320
-        );
+        calcularValorRobuxCentavos(
+                    quantidade
+                );
 
     let valorCentavos =
         valorOriginalCentavos;
@@ -11163,7 +12025,7 @@ if (ticketExistente) {
 
             await interaction.update({
                 content:
-                    reservaPedido.motivo === "limite_metade"
+                    reservaPedido.motivo === "limite_percentual"
                         ? `<:danger:1549129849904566392> O estoque disponível mudou enquanto seu pedido estava sendo criado. Para manter vendas abertas, o máximo atual por pedido é **${formatarRobux(reservaPedido.limite)} Robux**.`
                         : `<:danger:1549129849904566392> O estoque disponível mudou enquanto seu pedido estava sendo criado. Temos **${formatarRobux(reservaPedido.disponivel)} Robux** disponíveis agora.`,
                 embeds: [],
@@ -11342,12 +12204,18 @@ if (ticketExistente) {
                 korblox: {
                     nome: "Korblox",
                     robux: 17000,
-                    valor: 544
+                    valorCentavos:
+                        calcularValorRobuxCentavos(
+                            17000
+                        )
                 },
                 headless: {
                     nome: "Headless",
                     robux: 31000,
-                    valor: 992
+                    valorCentavos:
+                        calcularValorRobuxCentavos(
+                            31000
+                        )
                 }
             };
 
@@ -11363,10 +12231,7 @@ if (ticketExistente) {
             }
 
             const valorOriginalCentavos =
-                Math.round(
-                    produto.valor *
-                    100
-                );
+                produto.valorCentavos;
 
             let valorCentavosItem =
                 valorOriginalCentavos;
@@ -11590,7 +12455,7 @@ if (ticketExistente) {
 
                     await interaction.update({
                         content:
-                            reservaPedido.motivo === "limite_metade"
+                            reservaPedido.motivo === "limite_percentual"
                                 ? `<:danger:1549129849904566392> O estoque disponível mudou enquanto seu pedido estava sendo criado. Para manter vendas abertas, o máximo atual por pedido é **${formatarRobux(reservaPedido.limite)} Robux**.`
                                 : `<:danger:1549129849904566392> O estoque disponível mudou enquanto seu pedido estava sendo criado. Temos **${formatarRobux(reservaPedido.disponivel)} Robux** disponíveis agora.`,
                         embeds: [],
